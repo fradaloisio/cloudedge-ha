@@ -1,7 +1,7 @@
 {
   "domain": "cloudedge",
   "name": "CloudEdge",
-  "version": "1.2.3",
+  "version": "1.3.0",
   "documentation": "https://github.com/fradaloisio/cloudedge-ha",
   "issue_tracker": "https://github.com/fradaloisio/cloudedge-ha/issues",
   "dependencies": ["stream"],
