@@ -89,23 +89,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
-    # Clean up cache when unloading (disable or remove integration)
+    # Stop background workers. Do NOT delete the session cache here:
+    # unload also runs on every reload, and CloudEdge allows one active
+    # session per account — wiping the cache forces a fresh login that
+    # logs out the vendor app. Cache removal lives in async_remove_entry.
     if entry.entry_id in hass.data[DOMAIN]:
         coordinator = hass.data[DOMAIN][entry.entry_id]
         await hass.async_add_executor_job(coordinator._stop_mqtt)
         await hass.async_add_executor_job(coordinator.stop_streams)
-        await hass.async_add_executor_job(coordinator.cleanup_cache)
-    
-    # Also clean up old cache file variants
-    for cache_name in [".cloudedge_session_cache", "cloudedge_session_cache"]:
-        cache_path = os.path.join(hass.config.config_dir, cache_name)
-        if os.path.exists(cache_path):
-            try:
-                await hass.async_add_executor_job(os.remove, cache_path)
-                _LOGGER.debug("Removed cache file: %s", cache_path)
-            except OSError as e:
-                _LOGGER.debug("Could not remove cache file %s: %s", cache_path, e)
-    
+
     if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
         hass.data[DOMAIN].pop(entry.entry_id)
         # Services are domain-wide: remove them only with the last entry
@@ -118,16 +110,25 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Remove a config entry and clean up associated files."""
     _LOGGER.info("Removing CloudEdge integration and cleaning up cache files")
-    
-    # Clean up both cache file variants (old and new)
-    for cache_name in [".cloudedge_session_cache", "cloudedge_session_cache"]:
-        cache_path = os.path.join(hass.config.config_dir, cache_name)
-        if os.path.exists(cache_path):
+
+    def _remove_cache_files() -> None:
+        # Per-entry cache plus legacy shared variants
+        cache_names = [
+            f"cloudedge_session_cache_{entry.entry_id}",
+            ".cloudedge_session_cache",
+            "cloudedge_session_cache",
+        ]
+        for cache_name in cache_names:
+            cache_path = os.path.join(hass.config.config_dir, cache_name)
             try:
-                await hass.async_add_executor_job(os.remove, cache_path)
+                os.remove(cache_path)
                 _LOGGER.info("Removed CloudEdge session cache: %s", cache_path)
+            except FileNotFoundError:
+                pass
             except OSError as e:
                 _LOGGER.warning("Failed to remove cache file %s: %s", cache_path, e)
+
+    await hass.async_add_executor_job(_remove_cache_files)
 
 
 
