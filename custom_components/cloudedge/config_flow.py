@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import logging
+import os
+import tempfile
+import uuid
 from typing import Any
 
 import voluptuous as vol
@@ -57,36 +60,38 @@ async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> dict[str,
     country_code = data[CONF_COUNTRY_CODE]
     phone_code = data[CONF_PHONE_CODE]
 
-    try:
-        # Create client and test authentication
-        _LOGGER.debug("Creating CloudEdge client for %s", username)
-        _LOGGER.debug("Country code: %s, Phone code: %s", country_code, phone_code)
-        
-        client = CloudEdgeClient(
-            username=username,
-            password=password,
-            country_code=country_code,
-            phone_code=phone_code,
-            debug=False,  # pycloudedge debug dumps raw API traffic (tokens) to logs
+    def _validate() -> int:
+        """Authenticate and count devices (runs in executor).
+
+        Uses a throwaway session cache path so the validation login's
+        token is not persisted (default pycloudedge path would leave a
+        token file in HA's working directory).
+        """
+        tmp_cache = os.path.join(
+            tempfile.gettempdir(), f"cloudedge_validate_{uuid.uuid4().hex}"
         )
-
-        # Test authentication
-        _LOGGER.debug("Testing authentication...")
-        success = await hass.async_add_executor_job(client.authenticate)
-        if not success:
-            _LOGGER.error("Authentication returned False")
-            raise InvalidAuth("Authentication failed")
-        _LOGGER.debug("Authentication successful")
-
-        # Try to get devices to ensure we can fetch data
-        _LOGGER.debug("Fetching devices...")
         try:
-            devices = await hass.async_add_executor_job(client.get_all_devices)
-            device_count = len(devices) if devices else 0
-            _LOGGER.debug("Successfully retrieved %d devices", device_count)
-        except Exception as device_error:
-            _LOGGER.error("Error getting devices: %s", device_error, exc_info=True)
-            raise
+            client = CloudEdgeClient(
+                username=username,
+                password=password,
+                country_code=country_code,
+                phone_code=phone_code,
+                debug=False,  # pycloudedge debug dumps raw API traffic (tokens) to logs
+                session_cache_file=tmp_cache,
+            )
+            if not client.authenticate():
+                raise InvalidAuth("Authentication failed")
+            devices = client.get_all_devices()
+            return len(devices) if devices else 0
+        finally:
+            try:
+                os.remove(tmp_cache)
+            except OSError:
+                pass
+
+    try:
+        _LOGGER.debug("Validating CloudEdge credentials for %s", username)
+        device_count = await hass.async_add_executor_job(_validate)
 
         _LOGGER.info(
             "Successfully validated CloudEdge credentials. Found %d devices.",
@@ -99,6 +104,8 @@ async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> dict[str,
             "device_count": device_count,
         }
 
+    except InvalidAuth:
+        raise
     except AuthenticationError as e:
         _LOGGER.error("Authentication failed: %s", e)
         raise InvalidAuth("Authentication failed") from e
@@ -122,12 +129,14 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         errors: dict[str, str] = {}
         
         if user_input is not None:
+            # Duplicate check BEFORE logging in: a validation login kills
+            # the active CloudEdge session (one session per account), so
+            # don't pay that price for an account that is already set up.
+            await self.async_set_unique_id(user_input[CONF_USERNAME].strip().lower())
+            self._abort_if_unique_id_configured()
+
             try:
                 info = await validate_input(self.hass, user_input)
-                
-                # Check if already configured
-                await self.async_set_unique_id(user_input[CONF_USERNAME])
-                self._abort_if_unique_id_configured()
 
                 return self.async_create_entry(title=info["title"], data=user_input)
             except CannotConnect:
