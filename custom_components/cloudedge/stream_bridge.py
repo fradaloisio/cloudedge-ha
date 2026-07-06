@@ -449,26 +449,42 @@ class CloudEdgeStreamBridge:
                 return
             try:
                 client, addr = server.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                # Listening socket closed/broken: end the accept loop.
+                return
+
+            # Per-client failures must never kill the accept loop: a client
+            # resetting mid-bootstrap would otherwise leave the port
+            # listening but unserviced for every future connection.
+            try:
                 client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 client.settimeout(5)
                 with self._stream_clients_lock:
                     if self._mpegts_bootstrap:
                         client.sendall(self._mpegts_bootstrap)
                     self._stream_clients.append(client)
-                self._last_client_time = time.monotonic()
-                _LOGGER.debug("Stream client connected for %s from %s", self._serial_number, addr)
-                if not self._ensure_pipeline_started():
-                    with self._stream_clients_lock:
-                        if client in self._stream_clients:
-                            self._stream_clients.remove(client)
-                    try:
-                        client.close()
-                    except OSError:
-                        pass
-            except socket.timeout:
+            except OSError as err:
+                _LOGGER.debug(
+                    "Stream client handshake failed for %s: %s", self._serial_number, err
+                )
+                try:
+                    client.close()
+                except OSError:
+                    pass
                 continue
-            except OSError:
-                return
+
+            self._last_client_time = time.monotonic()
+            _LOGGER.debug("Stream client connected for %s from %s", self._serial_number, addr)
+            if not self._ensure_pipeline_started():
+                with self._stream_clients_lock:
+                    if client in self._stream_clients:
+                        self._stream_clients.remove(client)
+                try:
+                    client.close()
+                except OSError:
+                    pass
 
     def _ensure_pipeline_started(self) -> bool:
         """Start ffmpeg and the P2P worker on the first real stream consumer."""
