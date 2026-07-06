@@ -16,6 +16,7 @@ from typing import Dict, Any
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .const import (
@@ -58,8 +59,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass, username, password, country_code, phone_code, refresh_interval, entry
     )
 
-    # Validate authentication before first refresh
-    await coordinator.async_validate_authentication()
+    # Validate authentication before first refresh.
+    # AuthenticationError -> reauth flow; anything else -> HA retry backoff.
+    from cloudedge.exceptions import AuthenticationError
+
+    try:
+        await coordinator.async_validate_authentication()
+    except AuthenticationError as err:
+        raise ConfigEntryAuthFailed(f"CloudEdge authentication failed: {err}") from err
+    except Exception as err:
+        raise ConfigEntryNotReady(f"CloudEdge not reachable: {err}") from err
 
     # Fetch initial data with error handling
     success = await coordinator.async_safe_first_refresh()
@@ -224,10 +233,13 @@ class CloudEdgeCoordinator(DataUpdateCoordinator):
                 self._authenticated = False
                 raise AuthenticationError("Initial authentication failed")
                 
+        except AuthenticationError:
+            self._authenticated = False
+            raise
         except Exception as auth_error:
             _LOGGER.error("Initial authentication validation failed: %s", auth_error)
             self._authenticated = False
-            raise AuthenticationError(f"Authentication validation failed: {auth_error}")
+            raise
 
     async def _async_update_data(self) -> Dict[str, Any]:
         """Update data via library."""
