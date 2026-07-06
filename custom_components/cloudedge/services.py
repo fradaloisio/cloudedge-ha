@@ -7,6 +7,7 @@ from typing import Any
 import voluptuous as vol
 
 from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import config_validation as cv
 
 from .const import DOMAIN
@@ -91,8 +92,7 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                     _LOGGER.debug("Error finding device in coordinator %s: %s", entry_id, e)
 
         if not coordinator:
-            _LOGGER.error("Device %s not found in any coordinator", device_name)
-            return
+            raise HomeAssistantError(f"Device {device_name} not found in any coordinator")
 
         try:
             success = await hass.async_add_executor_job(
@@ -101,31 +101,24 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                 parameter_name,
                 value,
             )
-
-            if success:
-                _LOGGER.info(
-                    "Successfully set %s to %s for device %s",
-                    parameter_name,
-                    value,
-                    device_name,
-                )
-                # Refresh the coordinator to update entity states
-                await coordinator.async_request_refresh()
-            else:
-                _LOGGER.error(
-                    "Failed to set %s to %s for device %s",
-                    parameter_name,
-                    value,
-                    device_name,
-                )
-
         except Exception as e:
-            _LOGGER.error(
-                "Error setting parameter %s for device %s: %s",
-                parameter_name,
-                device_name,
-                e,
+            raise HomeAssistantError(
+                f"Error setting parameter {parameter_name} for device {device_name}: {e}"
+            ) from e
+
+        if not success:
+            raise HomeAssistantError(
+                f"Failed to set {parameter_name} to {value} for device {device_name}"
             )
+
+        _LOGGER.info(
+            "Successfully set %s to %s for device %s",
+            parameter_name,
+            value,
+            device_name,
+        )
+        # Refresh the coordinator to update entity states
+        await coordinator.async_request_refresh()
 
     async def async_get_device_info(call: ServiceCall) -> None:
         """Get device information."""
@@ -149,8 +142,7 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                     _LOGGER.debug("Error finding device in coordinator %s: %s", entry_id, e)
 
         if not coordinator:
-            _LOGGER.error("Device %s not found in any coordinator", device_name)
-            return
+            raise HomeAssistantError(f"Device {device_name} not found in any coordinator")
 
         try:
             device_info = await hass.async_add_executor_job(
@@ -158,22 +150,23 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                 device_name,
                 include_config,
             )
-
-            if device_info:
-                _LOGGER.info("Device info for %s: %s", device_name, device_info)
-                # You could emit an event here with the device info
-                hass.bus.async_fire(
-                    f"{DOMAIN}_device_info",
-                    {
-                        "device_name": device_name,
-                        "device_info": device_info,
-                    },
-                )
-            else:
-                _LOGGER.error("Failed to get device info for %s", device_name)
-
         except Exception as e:
-            _LOGGER.error("Error getting device info for %s: %s", device_name, e)
+            raise HomeAssistantError(
+                f"Error getting device info for {device_name}: {e}"
+            ) from e
+
+        if not device_info:
+            raise HomeAssistantError(f"Failed to get device info for {device_name}")
+
+        _LOGGER.info("Device info for %s: %s", device_name, device_info)
+        # You could emit an event here with the device info
+        hass.bus.async_fire(
+            f"{DOMAIN}_device_info",
+            {
+                "device_name": device_name,
+                "device_info": device_info,
+            },
+        )
 
     async def async_refresh_device(call: ServiceCall) -> None:
         """Refresh device data."""
@@ -199,7 +192,7 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                 await coordinator.async_request_refresh()
                 _LOGGER.info("Refreshed data for device %s", device_name)
             else:
-                _LOGGER.error("Device %s not found", device_name)
+                raise HomeAssistantError(f"Device {device_name} not found")
         else:
             # Refresh all coordinators
             _LOGGER.debug("Refreshing data for all devices")
@@ -229,56 +222,56 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                     _LOGGER.debug("Error finding device in coordinator %s: %s", entry_id, e)
 
         if not coordinator:
-            _LOGGER.error("Device %s not found in any coordinator", device_name)
-            return
+            raise HomeAssistantError(f"Device {device_name} not found in any coordinator")
 
         # Use the coordinator's targeted refresh method
         success = await coordinator.async_refresh_device_config(device_name)
-        
-        if success:
-            _LOGGER.info("Successfully refreshed parameters for device %s", device_name)
-        else:
-            _LOGGER.warning("Failed to refresh parameters for device %s", device_name)
+
+        if not success:
+            raise HomeAssistantError(
+                f"Failed to refresh parameters for device {device_name}"
+            )
+        _LOGGER.info("Successfully refreshed parameters for device %s", device_name)
 
     
+
+    def _all_coordinators() -> list[Any]:
+        """Return every loaded coordinator, not just the first one."""
+        return [
+            hass.data[DOMAIN][config_entry.entry_id]
+            for config_entry in hass.config_entries.async_entries(DOMAIN)
+            if config_entry.entry_id in hass.data[DOMAIN]
+        ]
 
     async def async_get_coordinator_info(call: ServiceCall) -> None:
         """Get coordinator diagnostic information."""
         _LOGGER.info("Getting CloudEdge coordinator information...")
-        
-        # Find any coordinator
-        coordinator = None
-        for config_entry in hass.config_entries.async_entries(DOMAIN):
-            if config_entry.entry_id in hass.data[DOMAIN]:
-                coordinator = hass.data[DOMAIN][config_entry.entry_id]
-                break
-        
-        if not coordinator:
-            _LOGGER.error("No CloudEdge coordinator found")
-            return
-            
-        try:
-            info = coordinator.get_coordinator_info()
-            _LOGGER.info("CloudEdge Coordinator Info: %s", info)
-        except Exception as e:
-            _LOGGER.error("Error getting coordinator info: %s", e)
-    
+
+        coordinators = _all_coordinators()
+        if not coordinators:
+            raise HomeAssistantError("No CloudEdge coordinator found")
+
+        for coordinator in coordinators:
+            try:
+                info = coordinator.get_coordinator_info()
+                _LOGGER.info("CloudEdge Coordinator Info: %s", info)
+            except Exception as e:
+                raise HomeAssistantError(f"Error getting coordinator info: {e}") from e
+
     async def async_clear_cache(call: ServiceCall) -> None:
         """Clear CloudEdge session cache."""
         _LOGGER.info("Clearing CloudEdge session cache...")
-        
-        # Find any coordinator and clear its cache
-        coordinator = None
-        for config_entry in hass.config_entries.async_entries(DOMAIN):
-            if config_entry.entry_id in hass.data[DOMAIN]:
-                coordinator = hass.data[DOMAIN][config_entry.entry_id]
-                break
-        
-        if coordinator and hasattr(coordinator, 'cleanup_cache'):
-            coordinator.cleanup_cache()
-            _LOGGER.info("CloudEdge session cache cleared successfully")
-        else:
-            _LOGGER.warning("No CloudEdge coordinator found or cache cleanup method not available")
+
+        coordinators = [
+            c for c in _all_coordinators() if hasattr(c, "cleanup_cache")
+        ]
+        if not coordinators:
+            raise HomeAssistantError("No CloudEdge coordinator found")
+
+        for coordinator in coordinators:
+            # cleanup_cache does disk I/O — keep it off the event loop
+            await hass.async_add_executor_job(coordinator.cleanup_cache)
+        _LOGGER.info("CloudEdge session cache cleared for %d account(s)", len(coordinators))
 
     # Register services
     hass.services.async_register(
