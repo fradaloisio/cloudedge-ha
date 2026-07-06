@@ -89,9 +89,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
-    # Unload services
-    await async_unload_services(hass)
-    
     # Clean up cache when unloading (disable or remove integration)
     if entry.entry_id in hass.data[DOMAIN]:
         coordinator = hass.data[DOMAIN][entry.entry_id]
@@ -111,6 +108,9 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     
     if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
         hass.data[DOMAIN].pop(entry.entry_id)
+        # Services are domain-wide: remove them only with the last entry
+        if not hass.data[DOMAIN]:
+            await async_unload_services(hass)
 
     return unload_ok
 

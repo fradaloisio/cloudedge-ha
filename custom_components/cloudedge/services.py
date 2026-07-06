@@ -56,7 +56,12 @@ CLEAR_CACHE_SCHEMA = vol.Schema({})  # No parameters needed
 
 
 async def async_setup_services(hass: HomeAssistant) -> None:
-    """Set up services for CloudEdge integration."""
+    """Set up services for CloudEdge integration.
+
+    Services are domain-wide (shared by all config entries): register once.
+    """
+    if hass.services.has_service(DOMAIN, SERVICE_SET_PARAMETER):
+        return
 
     async def async_set_parameter(call: ServiceCall) -> None:
         """Set a device parameter."""
