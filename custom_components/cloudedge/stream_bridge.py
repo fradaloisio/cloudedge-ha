@@ -133,11 +133,50 @@ def _detect_video_codec(frame_data: bytes) -> str | None:
 
 
 def _is_video_keyframe(frame_data: bytes, codec: str) -> bool:
-    """Return True if the access unit contains a codec keyframe."""
+    """Return True if the access unit contains an actual keyframe slice.
+
+    Parameter sets (SPS/PPS/VPS) alone do NOT count: an IDR-less access
+    unit cannot be decoded, and an IDR without parameter sets is handled
+    separately by prepending cached ones.
+    """
     headers = list(_annex_b_nal_headers(frame_data))
     if codec == "h264":
-        return any((header & 0x1F) in {5, 7, 8} for header in headers)
-    return any(((header >> 1) & 0x3F) in {19, 20, 32, 33, 34} for header in headers)
+        return any((header & 0x1F) == 5 for header in headers)
+    return any(((header >> 1) & 0x3F) in {19, 20} for header in headers)
+
+
+def _iter_nal_units(frame_data: bytes):
+    """Yield each Annex B NAL unit payload (start code stripped)."""
+    positions = []
+    i = 0
+    n = len(frame_data)
+    while i + 3 <= n:
+        if frame_data[i:i + 3] == b"\x00\x00\x01":
+            positions.append(i + 3)
+            i += 3
+        else:
+            i += 1
+    for idx, start in enumerate(positions):
+        end = positions[idx + 1] - 3 if idx + 1 < len(positions) else n
+        # Drop the leading zero that belongs to the next 4-byte start code
+        while end > start and idx + 1 < len(positions) and frame_data[end - 1] == 0:
+            end -= 1
+        payload = frame_data[start:end]
+        if payload:
+            yield payload
+
+
+def _extract_parameter_sets(frame_data: bytes, codec: str) -> bytes:
+    """Return the SPS/PPS (H.264) or VPS/SPS/PPS (HEVC) NAL units."""
+    out = bytearray()
+    for nal in _iter_nal_units(frame_data):
+        if codec == "h264":
+            is_ps = (nal[0] & 0x1F) in (7, 8)
+        else:
+            is_ps = ((nal[0] >> 1) & 0x3F) in (32, 33, 34)
+        if is_ps:
+            out += b"\x00\x00\x00\x01" + nal
+    return bytes(out)
 
 
 class CloudEdgeStreamBridge:
@@ -154,6 +193,7 @@ class CloudEdgeStreamBridge:
         # a long wait during stop() cannot resurrect into the next session.
         self._session_generation = 0
         self._got_keyframe = False
+        self._pending_param_sets: bytes | None = None
 
         self._stream_port = 0
         self._stream_server: socket.socket | None = None
@@ -510,6 +550,7 @@ class CloudEdgeStreamBridge:
             self._session_generation += 1
             gen = self._session_generation
             self._got_keyframe = False
+            self._pending_param_sets = None
             with self._metrics_lock:
                 self._stream_state = "starting"
                 self._last_error = None
@@ -1070,6 +1111,9 @@ class CloudEdgeStreamBridge:
                     with self._metrics_lock:
                         self._reconnect_count += 1
                 self._got_keyframe = False
+                # Parameter sets are profile/resolution specific: never carry
+                # them into a new attempt (the profile may have switched).
+                self._pending_param_sets = None
                 self._profile_changed.clear()
                 video_id = self._active_video_id
                 with self._metrics_lock:
@@ -1112,7 +1156,24 @@ class CloudEdgeStreamBridge:
                     is_keyframe = _is_video_keyframe(frame_data, codec)
                     if not self._got_keyframe:
                         if not is_keyframe:
+                            # Some cameras send SPS/PPS in a separate access
+                            # unit before the IDR; cache them instead of
+                            # dropping, or the decoder can never start
+                            # ("non-existing PPS referenced").
+                            param_sets = _extract_parameter_sets(frame_data, codec)
+                            if param_sets:
+                                self._pending_param_sets = param_sets
                             return
+                        if not _extract_parameter_sets(frame_data, codec):
+                            if self._pending_param_sets:
+                                frame_data = self._pending_param_sets + frame_data
+                            else:
+                                _LOGGER.debug(
+                                    "First IDR for %s has no SPS/PPS and none "
+                                    "cached; waiting for the next keyframe",
+                                    self._serial_number,
+                                )
+                                return
                         if not self._start_ffmpeg_muxer(codec):
                             _LOGGER.error(
                                 "Failed to start %s muxer for %s",
