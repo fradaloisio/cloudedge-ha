@@ -41,6 +41,7 @@ _ONLINE_GRACE_WINDOW = 20.0
 _SIGNAL_STATUS_RETRY_WINDOW = 8.0
 _SIGNAL_STATUS_RETRY_POLL = 1.0
 _MAX_MPEGTS_BOOTSTRAP_BYTES = 4 * 1024 * 1024
+_MUX_STALL_TIMEOUT = 10.0
 _AUTO_FALLBACK_WINDOWS = 2
 _AUTO_SUBSTREAM_FAILURES = 2
 _AUTO_MAX_SUSTAINABLE_FPS = 6.0
@@ -776,6 +777,42 @@ class CloudEdgeStreamBridge:
             time.sleep(0.5)
             if not self._running:
                 return
+
+            # Muxer watchdog: bad input timestamps can wedge ffmpeg (mux
+            # errors, stops reading stdin) while the process stays alive —
+            # the pacer blocks on a full pipe and every new frame gets
+            # dropped as "backlogged" forever. Frames queued but nothing
+            # written for too long means exactly that: kill this ffmpeg so
+            # the pipeline restarts on the next keyframe.
+            stall_now = time.monotonic()
+            if (
+                self._last_video_write
+                and not self._video_queue.empty()
+                and stall_now - self._last_video_write > _MUX_STALL_TIMEOUT
+            ):
+                _LOGGER.warning(
+                    "ffmpeg for %s stopped consuming input for %.0fs — "
+                    "restarting the muxer",
+                    self._serial_number,
+                    stall_now - self._last_video_write,
+                )
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                # Drain stale frames and reopen the keyframe gate so the
+                # next IDR starts a fresh muxer.
+                while not self._video_queue.empty():
+                    try:
+                        self._video_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                self._got_keyframe = False
+                # Stale timestamp must not trip the next watchdog before the
+                # new pacer's first write.
+                self._last_video_write = 0.0
+                return
+
             kf = self._latest_keyframe
             if not kf:
                 continue
