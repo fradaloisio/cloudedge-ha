@@ -86,8 +86,9 @@ async def async_setup_entry(
             # Add known switch parameters first
             for param_name, param_key in SWITCH_PARAMETERS.items():
                 if param_key in config:
-                    enabled = param_key in ENABLED_BY_DEFAULT_SWITCH_PARAMS
-                    _LOGGER.debug("Creating CloudEdgeConfigSwitch %s (%s) - enabled by default: %s", 
+                    iot_info = IOT_PARAMETERS.get(param_key)
+                    enabled = bool(iot_info and iot_info["name"] in ENABLED_BY_DEFAULT_SWITCH_PARAMS)
+                    _LOGGER.debug("Creating CloudEdgeConfigSwitch %s (%s) - enabled by default: %s",
                                 param_name, param_key, enabled)
                     switch = CloudEdgeConfigSwitch(
                         coordinator, serial_number, device_info, param_name, param_key
@@ -169,8 +170,11 @@ class CloudEdgeConfigSwitch(CloudEdgeBaseSwitch):
         # All switches are configuration entities
         self._attr_entity_category = EntityCategory.CONFIG
         
-        # Enable by default for specific switches
-        self._attr_entity_registry_enabled_default = param_key in ENABLED_BY_DEFAULT_SWITCH_PARAMS
+        # Enable by default for specific switches (map code -> name first)
+        iot_info = IOT_PARAMETERS.get(param_key)
+        self._attr_entity_registry_enabled_default = bool(
+            iot_info and iot_info["name"] in ENABLED_BY_DEFAULT_SWITCH_PARAMS
+        )
 
     @property
     def is_on(self) -> bool | None:

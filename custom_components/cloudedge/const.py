@@ -224,14 +224,14 @@ DEVICE_TYPE_SENSOR = "Sensor"
 ENTITY_CATEGORY_CONFIG = "config"
 ENTITY_CATEGORY_DIAGNOSTIC = "diagnostic"
 
-# Parameter names for switches
+# Curated switch parameters (mapped to parameter codes, not names — the
+# coordinator keys device configuration by numeric IoT parameter code).
+# Codes from pycloudedge cloudedge/iot_parameters.py IOT_PARAMETERS.
 SWITCH_PARAMETERS = {
-    "front_light": "FRONT_LIGHT_SWITCH",
-    "motion_detection": "MOTION_DET_ENABLE",
-    "led_enable": "LED_ENABLE",
-    "sound_detection": "SOUND_DET_ENABLE",
-    "push_notifications": "PUSH_ENABLE",
-    "email_notifications": "EMAIL_ENABLE",
+    "front_light": "167",       # FRONT_LIGHT_SWITCH
+    "motion_detection": "150",  # MOTION_DET_ENABLE
+    "led_enable": "103",        # LED_ENABLE
+    "sound_detection": "109",   # SOUND_DET_ENABLE
 }
 
 # Parameter names for sensors (mapped to parameter codes, not names)
