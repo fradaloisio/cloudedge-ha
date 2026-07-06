@@ -291,7 +291,10 @@ class CloudEdgeGenericSensor(CloudEdgeBaseSensor):
             except (ValueError, TypeError, OSError):
                 return None
         elif self._iot_param_name in BOOLEAN_PARAMETERS:
-            return int(value) if value is not None else None
+            try:
+                return int(value) if value is not None else None
+            except (ValueError, TypeError):
+                return None
         elif self._iot_param_name in PERCENTAGE_PARAMETERS:
             try:
                 return int(value) if value is not None else None
