@@ -149,6 +149,10 @@ class CloudEdgeStreamBridge:
 
         self._lock = threading.Lock()
         self._running = False
+        # Incremented on every pipeline start. Worker/idle threads capture
+        # their generation and exit when it changes, so a thread blocked in
+        # a long wait during stop() cannot resurrect into the next session.
+        self._session_generation = 0
         self._got_keyframe = False
 
         self._stream_port = 0
@@ -385,22 +389,26 @@ class CloudEdgeStreamBridge:
             self._mpegts_bootstrap.clear()
             self._bootstrap_reset.clear()
 
-        if self._ffmpeg_proc is not None:
-            try:
-                if self._ffmpeg_proc.stdin:
-                    self._ffmpeg_proc.stdin.close()
-            except OSError:
-                pass
-            try:
-                self._ffmpeg_proc.terminate()
-                self._ffmpeg_proc.wait(timeout=5)
-            except Exception:
+        # Hold _ffmpeg_lock: _start_ffmpeg_muxer runs from the pycloudedge
+        # video-callback thread and could otherwise spawn a fresh ffmpeg
+        # right after this teardown, leaving an orphaned process.
+        with self._ffmpeg_lock:
+            if self._ffmpeg_proc is not None:
                 try:
-                    self._ffmpeg_proc.kill()
-                    self._ffmpeg_proc.wait(timeout=2)
-                except Exception:
+                    if self._ffmpeg_proc.stdin:
+                        self._ffmpeg_proc.stdin.close()
+                except OSError:
                     pass
-            self._ffmpeg_proc = None
+                try:
+                    self._ffmpeg_proc.terminate()
+                    self._ffmpeg_proc.wait(timeout=5)
+                except Exception:
+                    try:
+                        self._ffmpeg_proc.kill()
+                        self._ffmpeg_proc.wait(timeout=2)
+                    except Exception:
+                        pass
+                self._ffmpeg_proc = None
 
         while not self._video_queue.empty():
             try:
@@ -499,18 +507,22 @@ class CloudEdgeStreamBridge:
             # is a real consumer for this camera.
             self._kick_prewake()
             self._running = True
+            self._session_generation += 1
+            gen = self._session_generation
             self._got_keyframe = False
             with self._metrics_lock:
                 self._stream_state = "starting"
                 self._last_error = None
             self._worker_thread = threading.Thread(
                 target=self._stream_worker,
+                args=(gen,),
                 name=f"cloudedge_stream_{self._serial_number}",
                 daemon=True,
             )
             self._worker_thread.start()
             self._idle_watch_thread = threading.Thread(
                 target=self._idle_watch_loop,
+                args=(gen,),
                 name=f"cloudedge_stream_idle_{self._serial_number}",
                 daemon=True,
             )
@@ -538,6 +550,10 @@ class CloudEdgeStreamBridge:
 
     def _start_ffmpeg_muxer(self, video_codec: str) -> bool:
         with self._ffmpeg_lock:
+            if not self._running:
+                # Bridge stopped between the video callback firing and this
+                # call: do not spawn an ffmpeg nobody will tear down.
+                return False
             if self._ffmpeg_proc is not None and self._ffmpeg_proc.poll() is None:
                 return self._video_codec == video_codec
             self._video_codec = video_codec
@@ -985,13 +1001,17 @@ class CloudEdgeStreamBridge:
         streamer.run_session = _run_session_with_region_signaling
         streamer._cloudedge_status_retry_patch = True
 
-    def _stream_worker(self) -> None:
+    def _stream_worker(self, gen: int) -> None:
         consecutive_failures = 0
         device: dict | None = None
         bridge_owns_live_switch = False
         attempt_number = 0
+
+        def _session_active() -> bool:
+            return self._running and gen == self._session_generation
+
         try:
-            while self._running and self._should_keep_running():
+            while _session_active() and self._should_keep_running():
                 client = self._coordinator.client
                 device = self._get_stream_device()
                 if client is not None and device is not None:
@@ -1028,7 +1048,7 @@ class CloudEdgeStreamBridge:
             if supports_external_switch:
                 bridge_owns_live_switch = self._set_live_switch(device, True)
 
-            while self._running:
+            while _session_active():
                 if not self._should_keep_running():
                     return
 
@@ -1060,6 +1080,9 @@ class CloudEdgeStreamBridge:
                 def on_video(frame_data: bytes) -> None:
                     nonlocal attempt_frames, attempt_bytes
                     nonlocal first_frame_at, last_frame_at, max_frame_gap
+                    if gen != self._session_generation:
+                        # Stale callback from a previous session: drop it.
+                        return
                     received_at = time.monotonic()
                     attempt_frames += 1
                     attempt_bytes += len(frame_data)
@@ -1096,7 +1119,8 @@ class CloudEdgeStreamBridge:
                                 codec,
                                 self._serial_number,
                             )
-                            self._running = False
+                            if gen == self._session_generation:
+                                self._running = False
                             return
                         self._got_keyframe = True
                         _LOGGER.info(
@@ -1218,7 +1242,7 @@ class CloudEdgeStreamBridge:
                 cooldown_until = time.monotonic() + _RECONNECT_COOLDOWN
                 while time.monotonic() < cooldown_until:
                     if (
-                        not self._running
+                        not _session_active()
                         or not self.client_count
                         or not self._should_keep_running()
                     ):
@@ -1229,7 +1253,11 @@ class CloudEdgeStreamBridge:
         finally:
             if bridge_owns_live_switch and device is not None:
                 self._set_live_switch(device, False)
-            self.stop("worker_exit")
+            # Only tear down the pipeline we belong to: a stale worker from
+            # a previous session must not stop the live one.
+            with self._lock:
+                if gen == self._session_generation:
+                    self._stop_locked("worker_exit")
 
     def _wake_camera_if_needed(self, device: dict) -> bool:
         client = self._coordinator.client
@@ -1293,8 +1321,8 @@ class CloudEdgeStreamBridge:
             return True
         return (now - max(self._last_request_time, self._last_client_time)) < _IDLE_TIMEOUT
 
-    def _idle_watch_loop(self) -> None:
-        while self._running:
+    def _idle_watch_loop(self, gen: int) -> None:
+        while self._running and gen == self._session_generation:
             time.sleep(1)
             if self._should_keep_running():
                 continue
@@ -1306,7 +1334,9 @@ class CloudEdgeStreamBridge:
                 except Exception:
                     pass
             else:
-                self.stop("idle_timeout")
+                with self._lock:
+                    if gen == self._session_generation:
+                        self._stop_locked("idle_timeout")
                 return
 
 
