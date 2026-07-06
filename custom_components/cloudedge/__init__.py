@@ -15,7 +15,7 @@ from typing import Dict, Any
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
@@ -290,64 +290,23 @@ class CloudEdgeCoordinator(DataUpdateCoordinator):
             return
 
         def _on_event(device_id: str, evt_name: str, evt_type: int, is_motion: bool, extra: dict | None = None) -> None:
+            # Runs in the paho thread: do no work here. Coordinator data
+            # must only be read/replaced from the event loop, and blocking
+            # I/O here stalls the MQTT keepalive loop.
             extra = extra or {}
             _LOGGER.info(
                 "MQTT push event: %s  device_id=%s  motion=%s  url=%s",
                 evt_name, device_id, is_motion, bool(extra.get("url")),
             )
-            known_ids = {
-                sn: str(d.get("device_id")) for sn, d in self.data.items()
-            }
-            _LOGGER.debug("MQTT matching device_id=%r against known: %s", device_id, known_ids)
-
-            matched_sn: str | None = None
-            matched_name: str | None = None
-
-            for sn, dev_data in self.data.items():
-                if str(dev_data.get("device_id")) == device_id:
-                    dev_data["connection_status"] = "online"
-                    if is_motion:
-                        dev_data["last_motion_event"] = evt_name
-                        dev_data["last_motion_time"] = time.time()
-                    matched_sn = sn
-                    matched_name = dev_data.get("name", sn)
-                    break
-
-            # Download and decrypt alarm snapshot in background
-            alarm_url = extra.get("url", "")
-            if alarm_url and matched_sn:
-                try:
-                    from cloudedge.image_decrypt import decrypt_jpgx3_from_url
-                    jpeg = decrypt_jpgx3_from_url(alarm_url, matched_sn)
-                    if jpeg and matched_sn in self.data:
-                        self.data[matched_sn]["last_alarm_image"] = jpeg
-                        self.data[matched_sn]["last_alarm_time"] = time.time()
-                        _LOGGER.info(
-                            "Alarm snapshot decrypted for %s (%d bytes)",
-                            matched_name, len(jpeg),
-                        )
-                except Exception as exc:
-                    _LOGGER.debug("Alarm image decrypt failed: %s", exc)
-
-            # Push coordinator update (drives binary_sensor, sensor, camera, etc.)
+            if self.hass.loop.is_closed():
+                return
             self.hass.loop.call_soon_threadsafe(
-                self.async_set_updated_data, dict(self.data)
-            )
-
-            # Fire a Home Assistant event so users can build automations
-            event_data = {
-                "device_id": device_id,
-                "serial_number": matched_sn or "",
-                "device_name": matched_name or "",
-                "event_type": evt_name,
-                "event_code": evt_type,
-                "is_motion": is_motion,
-                "alarm_image_url": alarm_url,
-            }
-            self.hass.loop.call_soon_threadsafe(
-                self.hass.bus.async_fire,
-                f"{DOMAIN}_event",
-                event_data,
+                self._async_handle_push_event,
+                device_id,
+                evt_name,
+                evt_type,
+                is_motion,
+                extra.get("url", ""),
             )
 
         def _on_connect() -> None:
@@ -370,6 +329,86 @@ class CloudEdgeCoordinator(DataUpdateCoordinator):
                 _LOGGER.warning("CloudEdge MQTT listener failed to start")
         except Exception as exc:
             _LOGGER.warning("CloudEdge MQTT setup error: %s", exc)
+
+    @callback
+    def _async_handle_push_event(
+        self,
+        device_id: str,
+        evt_name: str,
+        evt_type: int,
+        is_motion: bool,
+        alarm_url: str,
+    ) -> None:
+        """Apply an MQTT push event to coordinator data (event loop only)."""
+        matched_sn: str | None = None
+        matched_name: str | None = None
+
+        new_data = dict(self.data or {})
+        for sn, dev_data in new_data.items():
+            if str(dev_data.get("device_id")) == device_id:
+                # Copy the device dict so entities never observe a
+                # half-applied mutation of shared state.
+                updated = dict(dev_data)
+                updated["connection_status"] = "online"
+                if is_motion:
+                    updated["last_motion_event"] = evt_name
+                    updated["last_motion_time"] = time.time()
+                new_data[sn] = updated
+                matched_sn = sn
+                matched_name = updated.get("name", sn)
+                break
+
+        # Push coordinator update (drives binary_sensor, sensor, camera, etc.)
+        self.async_set_updated_data(new_data)
+
+        # Download and decrypt the alarm snapshot without blocking the loop
+        if alarm_url and matched_sn:
+            self.hass.async_create_task(
+                self._async_fetch_alarm_image(alarm_url, matched_sn, matched_name)
+            )
+
+        # Fire a Home Assistant event so users can build automations
+        self.hass.bus.async_fire(
+            f"{DOMAIN}_event",
+            {
+                "device_id": device_id,
+                "serial_number": matched_sn or "",
+                "device_name": matched_name or "",
+                "event_type": evt_name,
+                "event_code": evt_type,
+                "is_motion": is_motion,
+                "alarm_image_url": alarm_url,
+            },
+        )
+
+    async def _async_fetch_alarm_image(
+        self, alarm_url: str, matched_sn: str, matched_name: str | None
+    ) -> None:
+        """Fetch and decrypt an alarm snapshot in the executor."""
+        try:
+            from cloudedge.image_decrypt import decrypt_jpgx3_from_url
+
+            jpeg = await self.hass.async_add_executor_job(
+                decrypt_jpgx3_from_url, alarm_url, matched_sn
+            )
+        except Exception as exc:
+            _LOGGER.debug("Alarm image decrypt failed: %s", exc)
+            return
+        if not jpeg:
+            return
+
+        new_data = dict(self.data or {})
+        dev_data = new_data.get(matched_sn)
+        if not dev_data:
+            return
+        updated = dict(dev_data)
+        updated["last_alarm_image"] = jpeg
+        updated["last_alarm_time"] = time.time()
+        new_data[matched_sn] = updated
+        _LOGGER.info(
+            "Alarm snapshot decrypted for %s (%d bytes)", matched_name, len(jpeg)
+        )
+        self.async_set_updated_data(new_data)
 
     def _stop_mqtt(self) -> None:
         """Stop the MQTT listener."""
