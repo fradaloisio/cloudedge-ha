@@ -31,7 +31,8 @@
     },
     "abort": {
       "already_configured": "L'account è già configurato",
-      "reauth_successful": "La riautenticazione è stata completata con successo"
+      "reauth_successful": "La riautenticazione è stata completata con successo",
+      "unknown": "Errore imprevisto"
     }
   },
   "options": {
