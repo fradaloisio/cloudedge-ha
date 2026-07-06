@@ -7,6 +7,7 @@ from typing import Any
 from homeassistant.components.switch import SwitchEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
@@ -265,25 +266,23 @@ class CloudEdgeConfigSwitch(CloudEdgeBaseSwitch):
                             else:
                                 await self.coordinator.async_request_refresh()
                     else:
-                        _LOGGER.error(
-                            "Failed to set parameter %s to %s for device %s - API returned false",
-                            param_name,
-                            value,
-                            device_name,
+                        raise HomeAssistantError(
+                            f"Failed to set {param_name} to {value} for device "
+                            f"{device_name}: API returned false"
                         )
                 else:
-                    _LOGGER.error("Device name not found for serial %s", self._serial_number)
+                    raise HomeAssistantError(
+                        f"Device name not found for serial {self._serial_number}"
+                    )
             else:
-                _LOGGER.error("CloudEdge client not available")
-        except Exception as err:
-            _LOGGER.error(
-                "Failed to set parameter %s to %s for device %s: %s",
-                self._param_key,
-                value,
-                self._serial_number,
-                err,
-            )
+                raise HomeAssistantError("CloudEdge client not available")
+        except HomeAssistantError:
             raise
+        except Exception as err:
+            raise HomeAssistantError(
+                f"Failed to set parameter {self._param_key} to {value} "
+                f"for device {self._serial_number}: {err}"
+            ) from err
 
     @property
     def icon(self) -> str:
@@ -441,25 +440,23 @@ class CloudEdgeGenericSwitch(CloudEdgeBaseSwitch):
                             else:
                                 await self.coordinator.async_request_refresh()
                     else:
-                        _LOGGER.error(
-                            "Failed to set parameter %s to %s for device %s - API returned false",
-                            param_name,
-                            value,
-                            device_name,
+                        raise HomeAssistantError(
+                            f"Failed to set {param_name} to {value} for device "
+                            f"{device_name}: API returned false"
                         )
                 else:
-                    _LOGGER.error("Device name not found for serial %s", self._serial_number)
+                    raise HomeAssistantError(
+                        f"Device name not found for serial {self._serial_number}"
+                    )
             else:
-                _LOGGER.error("CloudEdge client not available")
-        except Exception as err:
-            _LOGGER.error(
-                "Failed to set parameter %s to %s for device %s: %s",
-                self._param_key,
-                value,
-                self._serial_number,
-                err,
-            )
+                raise HomeAssistantError("CloudEdge client not available")
+        except HomeAssistantError:
             raise
+        except Exception as err:
+            raise HomeAssistantError(
+                f"Failed to set parameter {self._param_key} to {value} "
+                f"for device {self._serial_number}: {err}"
+            ) from err
 
     @property
     def icon(self) -> str:

@@ -12,6 +12,7 @@ from typing import Any, Dict, TYPE_CHECKING
 from homeassistant.components.button import ButtonEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
@@ -137,7 +138,9 @@ class CloudEdgeRefreshButton(CoordinatorEntity, ButtonEntity):
             self.async_write_ha_state()
                 
         except Exception as e:
-            _LOGGER.error(f"Error refreshing parameters for {self._device_name}: {e}")
             # Reset timestamp on error so user knows the refresh failed
             self._last_refresh = None
             self.async_write_ha_state()
+            raise HomeAssistantError(
+                f"Error refreshing parameters for {self._device_name}: {e}"
+            ) from e
