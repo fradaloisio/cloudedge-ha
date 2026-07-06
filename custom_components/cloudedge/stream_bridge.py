@@ -607,37 +607,45 @@ class CloudEdgeStreamBridge:
             self._ffmpeg_proc = None
             return False
 
+        # Bind every helper thread to THIS ffmpeg process. Re-reading
+        # self._ffmpeg_proc in the loops made old threads latch onto a
+        # restarted process: two pacers interleaving writes into one stdin
+        # (corrupted bitstream) and thread count growing on every crash.
+        proc = self._ffmpeg_proc
         self._ffmpeg_reader_thread = threading.Thread(
             target=self._ffmpeg_stdout_reader,
+            args=(proc,),
             name=f"cloudedge_ffmpeg_out_{self._serial_number}",
             daemon=True,
         )
         self._ffmpeg_reader_thread.start()
         self._ffmpeg_stderr_thread = threading.Thread(
             target=self._ffmpeg_stderr_reader,
+            args=(proc,),
             name=f"cloudedge_ffmpeg_err_{self._serial_number}",
             daemon=True,
         )
         self._ffmpeg_stderr_thread.start()
         self._video_pacer_thread = threading.Thread(
             target=self._video_pacer,
+            args=(proc,),
             name=f"cloudedge_video_pacer_{self._serial_number}",
             daemon=True,
         )
         self._video_pacer_thread.start()
         self._video_keepalive_thread = threading.Thread(
             target=self._video_keepalive,
+            args=(proc,),
             name=f"cloudedge_video_keepalive_{self._serial_number}",
             daemon=True,
         )
         self._video_keepalive_thread.start()
         return True
 
-    def _ffmpeg_stdout_reader(self) -> None:
+    def _ffmpeg_stdout_reader(self, proc: subprocess.Popen) -> None:
         try:
             while True:
-                proc = self._ffmpeg_proc
-                if proc is None or proc.poll() is not None or proc.stdout is None:
+                if proc.poll() is not None or proc.stdout is None:
                     return
                 data = proc.stdout.read1(32768)
                 if not data:
@@ -655,9 +663,8 @@ class CloudEdgeStreamBridge:
         except Exception as err:
             _LOGGER.debug("ffmpeg stdout reader stopped for %s: %s", self._serial_number, err)
 
-    def _ffmpeg_stderr_reader(self) -> None:
-        proc = self._ffmpeg_proc
-        if proc is None or proc.stderr is None:
+    def _ffmpeg_stderr_reader(self, proc: subprocess.Popen) -> None:
+        if proc.stderr is None:
             return
         try:
             for raw_line in proc.stderr:
@@ -667,15 +674,14 @@ class CloudEdgeStreamBridge:
         except Exception:
             return
 
-    def _video_pacer(self) -> None:
+    def _video_pacer(self, proc: subprocess.Popen) -> None:
         # KCP can deliver several seconds of video in a short burst after a gap.
         # Writing that burst immediately makes ffmpeg assign compressed wall-clock
         # timestamps, so HA freezes and then fast-forwards. Space writes using the
         # measured source cadence and never accelerate to catch up.
         next_write_at = 0.0
         while True:
-            proc = self._ffmpeg_proc
-            if proc is None or proc.poll() is not None or proc.stdin is None:
+            if proc.poll() is not None or proc.stdin is None:
                 return
             try:
                 data, reset_bootstrap = self._video_queue.get(timeout=0.5)
@@ -699,7 +705,7 @@ class CloudEdgeStreamBridge:
             except (BrokenPipeError, OSError, ValueError):
                 return
 
-    def _video_keepalive(self) -> None:
+    def _video_keepalive(self, proc: subprocess.Popen) -> None:
         # CloudEdge sources stall in two cases that would otherwise make the HLS
         # playlist stop advancing and the player give up: a slow cold-start wake
         # (the camera needs ~5-20s to leave dormancy) and shared/throttled cameras
@@ -708,8 +714,7 @@ class CloudEdgeStreamBridge:
         # with a held frame (decoder-safe: keyframes are self-contained, no broken
         # P-frame references) until real video resumes.
         while True:
-            proc = self._ffmpeg_proc
-            if proc is None or proc.poll() is not None:
+            if proc.poll() is not None:
                 return
             time.sleep(0.5)
             if not self._running:
