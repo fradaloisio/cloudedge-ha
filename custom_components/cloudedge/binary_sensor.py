@@ -125,22 +125,35 @@ class CloudEdgeMotionSensor(
         """React to coordinator data push (including MQTT events)."""
         super()._handle_coordinator_update()
 
-        if self.is_on and self._clear_unsub is None:
+        # Always reschedule while on: a new motion event during a pending
+        # timer must push the clear moment forward, otherwise the timer
+        # fires while is_on is still true and the sensor sticks "on".
+        if self.is_on:
             self._schedule_clear()
 
     def _schedule_clear(self) -> None:
-        """Schedule turning the sensor off after the clear delay."""
+        """(Re)schedule turning the sensor off when the motion window ends."""
         if self._clear_unsub is not None:
             self._clear_unsub()
+            self._clear_unsub = None
+
+        device_data = (self.coordinator.data or {}).get(self._serial_number, {})
+        last_time = device_data.get("last_motion_time")
+        if not last_time:
+            return
+        # Fire just after the motion window closes (0.5s margin so is_on
+        # has definitely flipped to False when the timer runs).
+        delay = max(0.0, last_time + MOTION_CLEAR_DELAY - time.time()) + 0.5
 
         @callback
         def _clear(_now: Any) -> None:
             self._clear_unsub = None
+            if self.is_on:
+                # New motion arrived while the timer was pending
+                self._schedule_clear()
             self.async_write_ha_state()
 
-        self._clear_unsub = async_call_later(
-            self.hass, MOTION_CLEAR_DELAY, _clear
-        )
+        self._clear_unsub = async_call_later(self.hass, delay, _clear)
 
     async def async_will_remove_from_hass(self) -> None:
         """Cancel pending timer on removal."""
