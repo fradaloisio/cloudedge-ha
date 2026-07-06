@@ -11,7 +11,7 @@ from typing import Any, Dict, TYPE_CHECKING
 
 from homeassistant.components.button import ButtonEntity
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
@@ -32,23 +32,25 @@ async def async_setup_entry(
     """Set up CloudEdge button entities from a config entry."""
     coordinator = hass.data[DOMAIN][config_entry.entry_id]
 
+    def _build_buttons() -> list[ButtonEntity]:
+        return [
+            CloudEdgeRefreshButton(coordinator, device_sn, device_data)
+            for device_sn, device_data in coordinator.data.items()
+        ]
+
     if not coordinator.data:
-        _LOGGER.warning("No devices found for button setup")
+        _LOGGER.warning("No device data available yet, button entities will be added when data is available")
+
+        @callback
+        def _async_add_when_ready() -> None:
+            if coordinator.data and not getattr(coordinator, "_buttons_added", False):
+                coordinator._buttons_added = True
+                async_add_entities(_build_buttons())
+
+        coordinator.async_add_listener(_async_add_when_ready)
         return
 
-    buttons = []
-    
-    for device_sn, device_data in coordinator.data.items():
-        # Add refresh parameters button for each device
-        buttons.append(
-            CloudEdgeRefreshButton(
-                coordinator,
-                device_sn,
-                device_data,
-            )
-        )
-
-    async_add_entities(buttons)
+    async_add_entities(_build_buttons())
 
 
 class CloudEdgeRefreshButton(CoordinatorEntity, ButtonEntity):

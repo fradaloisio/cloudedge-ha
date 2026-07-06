@@ -15,7 +15,7 @@ from homeassistant.components.sensor import (
 _CONNECTION_STATUS_OPTIONS = ["online", "dormancy", "offline", "unknown"]
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import PERCENTAGE, UnitOfTemperature
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
@@ -46,54 +46,66 @@ async def async_setup_entry(
     """Set up CloudEdge sensor platform."""
     coordinator: CloudEdgeCoordinator = hass.data[DOMAIN][config_entry.entry_id]
 
-    if not coordinator.data:
-        _LOGGER.warning("No device data available yet")
-        async_add_entities([])
-        return
-
-    sensors = []
-    for serial_number, device_info in coordinator.data.items():
-        # Connection status sensor is added for every device
-        sensors.append(CloudEdgeConnectionStatusSensor(
-            coordinator, serial_number, device_info
-        ))
-
-        if config := device_info.get("configuration"):
-            device_name = device_info.get("name", serial_number)
-            _LOGGER.info("Device %s has %d parameters", device_name, len(config))
-            
-            # Log which enabled-by-default parameters are present
-            enabled_params_present = [code for code in ENABLED_BY_DEFAULT_SENSOR_PARAMS if code in config]
-            _LOGGER.info("Device %s - Enabled-by-default params present: %s", 
-                        device_name, enabled_params_present if enabled_params_present else "None")
-            
-            for param_name, param_key in SENSOR_PARAMETERS.items():
-                if param_key in config:
-                    enabled = param_key in ENABLED_BY_DEFAULT_SENSOR_PARAMS
-                    _LOGGER.debug("Creating CloudEdgeConfigSensor %s (code %s) - enabled by default: %s", 
-                                param_name, param_key, enabled)
-                    sensors.append(CloudEdgeConfigSensor(
-                        coordinator, serial_number, device_info, param_name, param_key
-                    ))
-            
-            for param_code, param_info in config.items():
-                if param_code not in SENSOR_PARAMETERS.values():
-                    iot_param_info = IOT_PARAMETERS.get(param_code)
-                    if iot_param_info:
-                        param_name = iot_param_info["name"].lower()
-                    else:
-                        param_name = f"param_{param_code}"
-                    enabled = param_code in ENABLED_BY_DEFAULT_SENSOR_PARAMS
-                    if enabled:
-                        _LOGGER.debug("Creating enabled-by-default sensor: %s (code %s)", param_name, param_code)
-                    sensors.append(CloudEdgeGenericSensor(
-                        coordinator, serial_number, device_info, param_name, param_code, param_info
-                    ))
-        else:
-            sensors.append(CloudEdgeDeviceStatusSensor(
+    def _build_sensors() -> list[SensorEntity]:
+        sensors = []
+        for serial_number, device_info in coordinator.data.items():
+            # Connection status sensor is added for every device
+            sensors.append(CloudEdgeConnectionStatusSensor(
                 coordinator, serial_number, device_info
             ))
 
+            if config := device_info.get("configuration"):
+                device_name = device_info.get("name", serial_number)
+                _LOGGER.info("Device %s has %d parameters", device_name, len(config))
+
+                # Log which enabled-by-default parameters are present
+                enabled_params_present = [code for code in ENABLED_BY_DEFAULT_SENSOR_PARAMS if code in config]
+                _LOGGER.info("Device %s - Enabled-by-default params present: %s",
+                            device_name, enabled_params_present if enabled_params_present else "None")
+
+                for param_name, param_key in SENSOR_PARAMETERS.items():
+                    if param_key in config:
+                        enabled = param_key in ENABLED_BY_DEFAULT_SENSOR_PARAMS
+                        _LOGGER.debug("Creating CloudEdgeConfigSensor %s (code %s) - enabled by default: %s",
+                                    param_name, param_key, enabled)
+                        sensors.append(CloudEdgeConfigSensor(
+                            coordinator, serial_number, device_info, param_name, param_key
+                        ))
+
+                for param_code, param_info in config.items():
+                    if param_code not in SENSOR_PARAMETERS.values():
+                        iot_param_info = IOT_PARAMETERS.get(param_code)
+                        if iot_param_info:
+                            param_name = iot_param_info["name"].lower()
+                        else:
+                            param_name = f"param_{param_code}"
+                        enabled = param_code in ENABLED_BY_DEFAULT_SENSOR_PARAMS
+                        if enabled:
+                            _LOGGER.debug("Creating enabled-by-default sensor: %s (code %s)", param_name, param_code)
+                        sensors.append(CloudEdgeGenericSensor(
+                            coordinator, serial_number, device_info, param_name, param_code, param_info
+                        ))
+            else:
+                sensors.append(CloudEdgeDeviceStatusSensor(
+                    coordinator, serial_number, device_info
+                ))
+        return sensors
+
+    if not coordinator.data:
+        _LOGGER.warning("No device data available yet, sensor entities will be added when data is available")
+
+        @callback
+        def _async_add_when_ready() -> None:
+            if coordinator.data and not getattr(coordinator, "_sensors_added", False):
+                coordinator._sensors_added = True
+                sensors = _build_sensors()
+                _LOGGER.info("Adding %d sensor entities (deferred)", len(sensors))
+                async_add_entities(sensors)
+
+        coordinator.async_add_listener(_async_add_when_ready)
+        return
+
+    sensors = _build_sensors()
     _LOGGER.info("Adding %d sensor entities", len(sensors))
     async_add_entities(sensors)
 

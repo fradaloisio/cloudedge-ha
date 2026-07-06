@@ -5,7 +5,7 @@ from typing import Any
 
 from homeassistant.components.select import SelectEntity
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
@@ -26,12 +26,25 @@ async def async_setup_entry(
 ) -> None:
     """Set up per-camera stream profile selectors."""
     coordinator: CloudEdgeCoordinator = hass.data[DOMAIN][config_entry.entry_id]
-    entities = [
-        CloudEdgeStreamProfileSelect(coordinator, serial_number, device_info)
-        for serial_number, device_info in (coordinator.data or {}).items()
-        if device_info.get("type_id") in [1, 2, 3, 4, 5]
-    ]
-    async_add_entities(entities)
+
+    def _build_selects() -> list[SelectEntity]:
+        return [
+            CloudEdgeStreamProfileSelect(coordinator, serial_number, device_info)
+            for serial_number, device_info in (coordinator.data or {}).items()
+            if device_info.get("type_id") in [1, 2, 3, 4, 5]
+        ]
+
+    if not coordinator.data:
+        @callback
+        def _async_add_when_ready() -> None:
+            if coordinator.data and not getattr(coordinator, "_selects_added", False):
+                coordinator._selects_added = True
+                async_add_entities(_build_selects())
+
+        coordinator.async_add_listener(_async_add_when_ready)
+        return
+
+    async_add_entities(_build_selects())
 
 
 class CloudEdgeStreamProfileSelect(
