@@ -67,7 +67,7 @@ async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> dict[str,
             password=password,
             country_code=country_code,
             phone_code=phone_code,
-            debug=True,  # Enable debug to see API errors
+            debug=False,  # pycloudedge debug dumps raw API traffic (tokens) to logs
         )
 
         # Test authentication

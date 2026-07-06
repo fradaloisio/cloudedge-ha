@@ -203,7 +203,7 @@ class CloudEdgeCoordinator(DataUpdateCoordinator):
                     password=self.password,
                     country_code=self.country_code,
                     phone_code=self.phone_code,
-                    debug=True,  # Enable debug logging
+                    debug=False,  # pycloudedge debug dumps raw API traffic (tokens) to logs
                     session_cache_file=self._session_cache_path(),
                 )
 
@@ -506,7 +506,7 @@ class CloudEdgeCoordinator(DataUpdateCoordinator):
                     password=self.password,
                     country_code=self.country_code,
                     phone_code=self.phone_code,
-                    debug=True,  # Enable debug logging
+                    debug=False,  # pycloudedge debug dumps raw API traffic (tokens) to logs
                     session_cache_file=self._session_cache_path(),
                 )
 
@@ -557,7 +557,7 @@ class CloudEdgeCoordinator(DataUpdateCoordinator):
             _LOGGER.debug("Fetching device data from CloudEdge API")
             try:
                 devices = self.client.get_all_devices()
-                _LOGGER.debug("Raw devices from API: %s", devices)
+                _LOGGER.debug("Fetched %d devices from API", len(devices) if devices else 0)
             except AuthenticationError as auth_error:
                 _LOGGER.warning("Authentication error during device fetch, retrying with fresh auth: %s", auth_error)
                 # Reset authentication and retry once
