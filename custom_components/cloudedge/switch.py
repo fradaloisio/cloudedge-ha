@@ -6,7 +6,7 @@ from typing import Any
 
 from homeassistant.components.switch import SwitchEntity
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
@@ -39,8 +39,11 @@ async def async_setup_entry(
     if not coordinator.data:
         _LOGGER.warning("No device data available yet, switch entities will be added when data is available")
         
-        # Add a listener to create entities when data becomes available
-        async def _handle_coordinator_update():
+        # Add a listener to create entities when data becomes available.
+        # Must be a sync @callback: async_add_listener invokes listeners
+        # synchronously, so an async def would never be awaited.
+        @callback
+        def _handle_coordinator_update() -> None:
             if coordinator.data and not getattr(coordinator, '_switches_added', False):
                 _LOGGER.info("Device data is now available, adding switch entities")
                 switches = []

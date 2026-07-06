@@ -7,7 +7,7 @@ from typing import Any
 
 from homeassistant.components.camera import Camera, CameraEntityFeature
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
@@ -32,8 +32,11 @@ async def async_setup_entry(
     if not coordinator.data:
         _LOGGER.warning("No device data available yet, camera entities will be added when data is available")
         
-        # Add a listener to create entities when data becomes available
-        async def _handle_coordinator_update():
+        # Add a listener to create entities when data becomes available.
+        # Must be a sync @callback: async_add_listener invokes listeners
+        # synchronously, so an async def would never be awaited.
+        @callback
+        def _handle_coordinator_update() -> None:
             if coordinator.data and not getattr(coordinator, '_cameras_added', False):
                 _LOGGER.info("Device data is now available, adding camera entities")
                 cameras = []
