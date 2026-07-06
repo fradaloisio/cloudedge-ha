@@ -156,20 +156,21 @@ class CloudEdgeCoordinator(DataUpdateCoordinator):
         self._mqtt_listener = None
         self._stream_manager = CloudEdgeStreamManager(self)
         
-        # Initialize data as empty dict to prevent None errors
-        self.data: Dict[str, Any] = {}
-
         _LOGGER.info(
             "Initializing CloudEdge coordinator with %d minute refresh interval",
             refresh_interval,
         )
-        
+
         super().__init__(
             hass,
             _LOGGER,
             name=DOMAIN,
             update_interval=timedelta(minutes=refresh_interval),
         )
+
+        # DataUpdateCoordinator.__init__ resets data to None; force empty dict
+        # so thread callbacks (MQTT) can safely iterate before first refresh.
+        self.data: Dict[str, Any] = {}
 
     def _session_cache_path(self) -> str:
         """Return the per-config-entry pycloudedge session cache path."""
