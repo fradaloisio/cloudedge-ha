@@ -600,11 +600,14 @@ class CloudEdgeCoordinator(DataUpdateCoordinator):
                 _LOGGER.debug("Fetched %d devices from API", len(devices) if devices else 0)
             except AuthenticationError as auth_error:
                 _LOGGER.warning("Authentication error during device fetch, retrying with fresh auth: %s", auth_error)
-                # Reset authentication and retry once
+                # Reset authentication and retry once. force_refresh is
+                # essential: the cache file on disk still looks valid, so a
+                # plain authenticate() would reload the dead session and
+                # fail with the same error forever.
                 self._authenticated = False
                 self.client.session_data = None
-                
-                success = self.client.authenticate()
+
+                success = self.client.authenticate(force_refresh=True)
                 if not success:
                     raise AuthenticationError("Re-authentication failed")
                 self._authenticated = True
