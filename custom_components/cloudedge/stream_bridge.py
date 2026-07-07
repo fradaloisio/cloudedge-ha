@@ -10,8 +10,11 @@ This module keeps the Home Assistant camera entity thin. The entity exposes a
 """
 from __future__ import annotations
 
+import errno
 import inspect
+import itertools
 import logging
+import os
 import queue
 import socket
 import subprocess
@@ -42,6 +45,16 @@ _SIGNAL_STATUS_RETRY_WINDOW = 8.0
 _SIGNAL_STATUS_RETRY_POLL = 1.0
 _MAX_MPEGTS_BOOTSTRAP_BYTES = 4 * 1024 * 1024
 _MUX_STALL_TIMEOUT = 10.0
+
+# Camera audio: G.711 µ-law, 8 kHz mono (8000 bytes/s), transcoded to AAC.
+# The writer feeds ffmpeg at a fixed cadence — real audio when available,
+# µ-law silence otherwise — so the audio clock never stalls the muxer.
+_AUDIO_ENABLED = True
+_AUDIO_CHUNK_BYTES = 160          # 20 ms @ 8 kHz
+_AUDIO_CHUNK_SECONDS = 0.02
+_AUDIO_BUFFER_MAX_BYTES = 16000   # cap buffered audio at 2 s (bounds latency)
+_MULAW_SILENCE = 0xFF
+_AUDIO_FIFO_COUNTER = itertools.count()
 _AUTO_FALLBACK_WINDOWS = 2
 _AUTO_SUBSTREAM_FAILURES = 2
 _AUTO_MAX_SUSTAINABLE_FPS = 6.0
@@ -211,6 +224,10 @@ class CloudEdgeStreamBridge:
         self._ffmpeg_stderr_thread: threading.Thread | None = None
         self._video_pacer_thread: threading.Thread | None = None
         self._video_keepalive_thread: threading.Thread | None = None
+        self._audio_writer_thread: threading.Thread | None = None
+        self._audio_fifo_path: str | None = None
+        self._audio_buffer = bytearray()
+        self._audio_buffer_lock = threading.Lock()
         self._latest_keyframe: bytes | None = None
         self._video_queue: queue.Queue[tuple[bytes, bool]] = queue.Queue(maxsize=120)
 
@@ -457,6 +474,11 @@ class CloudEdgeStreamBridge:
             except queue.Empty:
                 break
 
+        self._cleanup_audio_fifo(self._audio_fifo_path)
+        self._audio_fifo_path = None
+        with self._audio_buffer_lock:
+            self._audio_buffer.clear()
+
         if close_listener:
             self._stream_port = 0
         self._worker_thread = None
@@ -465,6 +487,7 @@ class CloudEdgeStreamBridge:
         self._ffmpeg_stderr_thread = None
         self._video_pacer_thread = None
         self._video_keepalive_thread = None
+        self._audio_writer_thread = None
         self._latest_keyframe = None
         self._coordinator.notify_stream_state_changed()
 
@@ -602,6 +625,7 @@ class CloudEdgeStreamBridge:
             return self._start_ffmpeg_muxer_locked(video_codec)
 
     def _start_ffmpeg_muxer_locked(self, video_codec: str) -> bool:
+        audio_fifo = self._prepare_audio_fifo() if _AUDIO_ENABLED else None
         cmd = [
             "ffmpeg",
             "-hide_banner",
@@ -625,7 +649,26 @@ class CloudEdgeStreamBridge:
             video_codec,
             "-i",
             "pipe:0",
-            "-an",
+        ]
+        if audio_fifo:
+            # Second input: G.711 µ-law from the camera via a named FIFO fed
+            # at a fixed cadence (silence-filled), wallclock-stamped so A/V
+            # stay aligned across live-window gaps.
+            cmd += [
+                "-thread_queue_size",
+                "512",
+                "-use_wallclock_as_timestamps",
+                "1",
+                "-f",
+                "mulaw",
+                "-ar",
+                "8000",
+                "-ac",
+                "1",
+                "-i",
+                audio_fifo,
+            ]
+        cmd += [
             "-map",
             "0:v:0",
             "-c:v",
@@ -634,6 +677,13 @@ class CloudEdgeStreamBridge:
             # values and invalid decode ordering across held frames/reconnects.
             "-bsf:v",
             "setts=pts=PTS-STARTPTS:dts=PTS-STARTPTS",
+        ]
+        if audio_fifo:
+            # HLS in browsers cannot play raw µ-law: transcode to AAC.
+            cmd += ["-map", "1:a:0", "-c:a", "aac", "-b:a", "24k"]
+        else:
+            cmd += ["-an"]
+        cmd += [
             "-muxdelay",
             "0",
             "-muxpreload",
@@ -659,11 +709,15 @@ class CloudEdgeStreamBridge:
         except FileNotFoundError:
             _LOGGER.error("ffmpeg not found in PATH; CloudEdge live stream is unavailable")
             self._ffmpeg_proc = None
+            self._cleanup_audio_fifo(audio_fifo)
             return False
         except Exception as err:
             _LOGGER.error("Failed to start ffmpeg for %s: %s", self._serial_number, err)
             self._ffmpeg_proc = None
+            self._cleanup_audio_fifo(audio_fifo)
             return False
+
+        self._audio_fifo_path = audio_fifo
 
         # Bind every helper thread to THIS ffmpeg process. Re-reading
         # self._ffmpeg_proc in the loops made old threads latch onto a
@@ -698,7 +752,99 @@ class CloudEdgeStreamBridge:
             daemon=True,
         )
         self._video_keepalive_thread.start()
+        if audio_fifo:
+            self._audio_writer_thread = threading.Thread(
+                target=self._audio_writer,
+                args=(proc, audio_fifo),
+                name=f"cloudedge_audio_writer_{self._serial_number}",
+                daemon=True,
+            )
+            self._audio_writer_thread.start()
         return True
+
+    def _prepare_audio_fifo(self) -> str | None:
+        """Create the named FIFO used as ffmpeg's audio input."""
+        path = (
+            f"/tmp/cloudedge_audio_{self._serial_number}_"
+            f"{next(_AUDIO_FIFO_COUNTER)}.fifo"
+        )
+        try:
+            os.mkfifo(path)
+        except OSError as err:
+            _LOGGER.warning(
+                "Audio disabled for %s: cannot create fifo %s: %s",
+                self._serial_number,
+                path,
+                err,
+            )
+            return None
+        return path
+
+    @staticmethod
+    def _cleanup_audio_fifo(path: str | None) -> None:
+        if not path:
+            return
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+    def _audio_writer(self, proc: subprocess.Popen, fifo_path: str) -> None:
+        """Feed ffmpeg's audio FIFO at a fixed 8 kB/s cadence.
+
+        Writes real camera audio when buffered, µ-law silence otherwise, so
+        the audio clock keeps running during live-window gaps and the muxer
+        never stalls waiting for the audio input.
+        """
+        fd = None
+        try:
+            # ffmpeg opens the FIFO's read side while parsing its inputs;
+            # O_NONBLOCK + retry avoids blocking forever if it dies first.
+            while fd is None:
+                if proc.poll() is not None:
+                    return
+                try:
+                    fd = os.open(fifo_path, os.O_WRONLY | os.O_NONBLOCK)
+                except OSError as err:
+                    if err.errno != errno.ENXIO:
+                        _LOGGER.debug(
+                            "Audio fifo open failed for %s: %s",
+                            self._serial_number,
+                            err,
+                        )
+                        return
+                    time.sleep(0.05)
+            os.set_blocking(fd, True)
+
+            silence = bytes([_MULAW_SILENCE]) * _AUDIO_CHUNK_BYTES
+            next_write = time.monotonic()
+            while proc.poll() is None:
+                with self._audio_buffer_lock:
+                    if self._audio_buffer:
+                        chunk = bytes(self._audio_buffer[:_AUDIO_CHUNK_BYTES])
+                        del self._audio_buffer[:_AUDIO_CHUNK_BYTES]
+                    else:
+                        chunk = silence
+                if len(chunk) < _AUDIO_CHUNK_BYTES:
+                    chunk += silence[: _AUDIO_CHUNK_BYTES - len(chunk)]
+                try:
+                    os.write(fd, chunk)
+                except (BrokenPipeError, OSError):
+                    return
+                next_write += _AUDIO_CHUNK_SECONDS
+                delay = next_write - time.monotonic()
+                if delay > 0:
+                    time.sleep(delay)
+                else:
+                    # Fell behind (e.g. blocked write); restart the cadence.
+                    next_write = time.monotonic()
+        finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            self._cleanup_audio_fifo(fifo_path)
 
     def _ffmpeg_stdout_reader(self, proc: subprocess.Popen) -> None:
         try:
@@ -808,6 +954,8 @@ class CloudEdgeStreamBridge:
                     except queue.Empty:
                         break
                 self._got_keyframe = False
+                with self._audio_buffer_lock:
+                    self._audio_buffer.clear()
                 # Stale timestamp must not trip the next watchdog before the
                 # new pacer's first write.
                 self._last_video_write = 0.0
@@ -1234,6 +1382,20 @@ class CloudEdgeStreamBridge:
                         self._latest_keyframe = frame_data
                     self._enqueue_video(frame_data, reset_bootstrap=is_keyframe)
 
+                def on_audio(audio_data: bytes) -> None:
+                    # G.711 µ-law payload from the camera (8 kHz mono).
+                    # Buffered until the audio writer drains it; capped so a
+                    # stalled pipeline cannot grow memory or add latency.
+                    if gen != self._session_generation or not self._got_keyframe:
+                        return
+                    if not audio_data:
+                        return
+                    with self._audio_buffer_lock:
+                        self._audio_buffer.extend(audio_data)
+                        excess = len(self._audio_buffer) - _AUDIO_BUFFER_MAX_BYTES
+                        if excess > 0:
+                            del self._audio_buffer[:excess]
+
                 def on_login() -> None:
                     nonlocal attempt_logged_in
                     attempt_logged_in = True
@@ -1262,6 +1424,8 @@ class CloudEdgeStreamBridge:
                         on_disconnect=on_disconnect,
                         video_id=video_id,
                     )
+                    if _AUDIO_ENABLED and "on_audio" in create_parameters:
+                        create_kwargs["on_audio"] = on_audio
                     if supports_external_switch:
                         create_kwargs["manage_stream_switch"] = not bridge_owns_live_switch
                     self._p2p_streamer = client.create_streamer(**create_kwargs)
