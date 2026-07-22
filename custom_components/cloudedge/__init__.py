@@ -29,6 +29,7 @@ from .const import (
 )
 from .services import async_setup_services, async_unload_services
 from .stream_bridge import CloudEdgeStreamManager
+from .auth_recovery import refresh_invalid_session
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -151,6 +152,7 @@ class CloudEdgeCoordinator(DataUpdateCoordinator):
         self.config_entry = config_entry
         self.client = None
         self._authenticated = False
+        self._force_auth_refresh = False
         self._setup_complete = False
         self._last_updated_device = None  # Track which device was last updated
         self._mqtt_listener = None
@@ -364,6 +366,27 @@ class CloudEdgeCoordinator(DataUpdateCoordinator):
             self._mqtt_listener = None
             _LOGGER.debug("CloudEdge MQTT listener stopped")
 
+    def _authenticate_client(self, *, force_refresh: bool = False) -> bool:
+        """Authenticate and keep MQTT credentials aligned with the session."""
+        if self.client is None:
+            return False
+
+        if force_refresh:
+            success = refresh_invalid_session(
+                self.client,
+                stop_transport=self._stop_mqtt,
+                start_transport=self._start_mqtt,
+            )
+        else:
+            success = bool(self.client.authenticate())
+            if success:
+                self._start_mqtt()
+
+        if success:
+            self._authenticated = True
+            self._force_auth_refresh = False
+        return success
+
     def _has_recent_mqtt_activity(self, device_data: dict[str, Any] | None) -> bool:
         """Return True if the device recently emitted an MQTT event."""
         last_event = (device_data or {}).get("last_motion_time")
@@ -527,12 +550,12 @@ class CloudEdgeCoordinator(DataUpdateCoordinator):
             if auth_needed:
                 _LOGGER.debug("Authenticating with CloudEdge API")
                 try:
-                    success = self.client.authenticate()
+                    success = self._authenticate_client(
+                        force_refresh=self._force_auth_refresh
+                    )
                     if not success:
                         raise AuthenticationError("Authentication failed")
-                    self._authenticated = True
                     _LOGGER.info("Successfully authenticated with CloudEdge API")
-                    self._start_mqtt()
                 except Exception as auth_error:
                     _LOGGER.error("Authentication failed: %s", auth_error)
                     # Reset authentication state
@@ -547,14 +570,14 @@ class CloudEdgeCoordinator(DataUpdateCoordinator):
                 _LOGGER.debug("Raw devices from API: %s", devices)
             except AuthenticationError as auth_error:
                 _LOGGER.warning("Authentication error during device fetch, retrying with fresh auth: %s", auth_error)
-                # Reset authentication and retry once
+                # The server rejected this token. Do not allow the next
+                # attempt to reload the same valid-looking cache entry.
                 self._authenticated = False
-                self.client.session_data = None
-                
-                success = self.client.authenticate()
+                self._force_auth_refresh = True
+
+                success = self._authenticate_client(force_refresh=True)
                 if not success:
                     raise AuthenticationError("Re-authentication failed")
-                self._authenticated = True
                 _LOGGER.info("Re-authenticated successfully, retrying device fetch")
                 
                 # Retry device fetch
@@ -682,6 +705,7 @@ class CloudEdgeCoordinator(DataUpdateCoordinator):
         except AuthenticationError as e:
             _LOGGER.error("Authentication failed: %s", e)
             self._authenticated = False
+            self._force_auth_refresh = True
             raise UpdateFailed(f"Authentication failed: {e}")
         except CloudEdgeError as e:
             _LOGGER.error("CloudEdge API error: %s", e)
