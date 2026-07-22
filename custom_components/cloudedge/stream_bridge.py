@@ -5,19 +5,20 @@ This module keeps the Home Assistant camera entity thin. The entity exposes a
 
 * CloudEdge P2P streaming via ``pycloudedge``
 * H.264/HEVC bitstream inspection
-* ``ffmpeg`` remuxing from raw video into MPEG-TS
+* ``ffmpeg`` muxing raw video and G.711 audio into MPEG-TS
 * a tiny local TCP server that Home Assistant can open via ``tcp://...``
 """
 from __future__ import annotations
 
 import inspect
 import logging
+import os
 import queue
 import socket
 import subprocess
 import threading
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, BinaryIO
 from urllib.parse import urlparse
 
 from .stream_profile_policy import resolve_stream_profile_ids
@@ -50,6 +51,9 @@ _AUTO_MAX_FRAME_GAP = 2.5
 _PACER_MIN_FPS = 2.0
 _PACER_MAX_FPS = 15.0
 _SUBSTREAM_INITIAL_FPS = 5.0
+_AUDIO_INPUT_SAMPLE_RATE = 8000
+_AUDIO_OUTPUT_SAMPLE_RATE = 16000
+_AUDIO_SILENCE_CHUNK = b"\xff" * 160  # 20 ms of G.711 mu-law silence
 
 STREAM_PROFILE_AUTO = "Auto"
 STREAM_PROFILE_MAIN = "HD"
@@ -168,8 +172,11 @@ class CloudEdgeStreamBridge:
         self._ffmpeg_stderr_thread: threading.Thread | None = None
         self._video_pacer_thread: threading.Thread | None = None
         self._video_keepalive_thread: threading.Thread | None = None
+        self._audio_writer_thread: threading.Thread | None = None
+        self._audio_pipe: BinaryIO | None = None
         self._latest_keyframe: bytes | None = None
         self._video_queue: queue.Queue[tuple[bytes, bool]] = queue.Queue(maxsize=120)
+        self._audio_queue: queue.Queue[bytes] = queue.Queue(maxsize=250)
 
         self._worker_thread: threading.Thread | None = None
         self._idle_watch_thread: threading.Thread | None = None
@@ -195,6 +202,9 @@ class CloudEdgeStreamBridge:
         self._last_session_fps = 0.0
         self._last_max_frame_gap = 0.0
         self._pacer_fps = _PACER_MAX_FPS
+        self._audio_frames = 0
+        self._audio_bytes = 0
+        self._last_audio_at = 0.0
         self._last_error: str | None = None
 
         self._last_request_time = 0.0
@@ -283,6 +293,13 @@ class CloudEdgeStreamBridge:
                 "stream_last_fps": round(self._last_session_fps, 2),
                 "stream_last_max_gap": round(self._last_max_frame_gap, 2),
                 "stream_pacer_fps": round(self._pacer_fps, 2),
+                "stream_audio_codec": "pcm_mulaw/8000",
+                "stream_audio_frames": self._audio_frames,
+                "stream_audio_bytes": self._audio_bytes,
+                "stream_audio_active": bool(
+                    self._last_audio_at
+                    and time.monotonic() - self._last_audio_at < 5.0
+                ),
                 "stream_last_error": self._last_error,
             }
 
@@ -394,6 +411,14 @@ class CloudEdgeStreamBridge:
             self._mpegts_bootstrap.clear()
             self._bootstrap_reset.clear()
 
+        audio_pipe = self._audio_pipe
+        self._audio_pipe = None
+        if audio_pipe is not None:
+            try:
+                audio_pipe.close()
+            except OSError:
+                pass
+
         if self._ffmpeg_proc is not None:
             try:
                 if self._ffmpeg_proc.stdin:
@@ -416,6 +441,11 @@ class CloudEdgeStreamBridge:
                 self._video_queue.get_nowait()
             except queue.Empty:
                 break
+        while not self._audio_queue.empty():
+            try:
+                self._audio_queue.get_nowait()
+            except queue.Empty:
+                break
 
         if close_listener:
             self._stream_port = 0
@@ -425,6 +455,7 @@ class CloudEdgeStreamBridge:
         self._ffmpeg_stderr_thread = None
         self._video_pacer_thread = None
         self._video_keepalive_thread = None
+        self._audio_writer_thread = None
         self._latest_keyframe = None
         self._coordinator.notify_stream_state_changed()
 
@@ -495,6 +526,9 @@ class CloudEdgeStreamBridge:
             self._got_keyframe = False
             with self._metrics_lock:
                 self._stream_state = "starting"
+                self._audio_frames = 0
+                self._audio_bytes = 0
+                self._last_audio_at = 0.0
                 self._last_error = None
             self._worker_thread = threading.Thread(
                 target=self._stream_worker,
@@ -537,6 +571,7 @@ class CloudEdgeStreamBridge:
             return self._start_ffmpeg_muxer_locked(video_codec)
 
     def _start_ffmpeg_muxer_locked(self, video_codec: str) -> bool:
+        audio_read_fd, audio_write_fd = os.pipe()
         cmd = [
             "ffmpeg",
             "-hide_banner",
@@ -560,15 +595,38 @@ class CloudEdgeStreamBridge:
             video_codec,
             "-i",
             "pipe:0",
-            "-an",
+            "-use_wallclock_as_timestamps",
+            "1",
+            "-thread_queue_size",
+            "512",
+            "-f",
+            "mulaw",
+            "-ar",
+            str(_AUDIO_INPUT_SAMPLE_RATE),
+            "-ac",
+            "1",
+            "-i",
+            f"pipe:{audio_read_fd}",
             "-map",
             "0:v:0",
+            "-map",
+            "1:a:0",
             "-c:v",
             "copy",
             # Preserve real arrival intervals while removing absolute clock
             # values and invalid decode ordering across held frames/reconnects.
             "-bsf:v",
             "setts=pts=PTS-STARTPTS:dts=PTS-STARTPTS",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "32k",
+            "-ar",
+            str(_AUDIO_OUTPUT_SAMPLE_RATE),
+            "-ac",
+            "1",
+            "-af",
+            "aresample=async=1:first_pts=0",
             "-muxdelay",
             "0",
             "-muxpreload",
@@ -582,13 +640,20 @@ class CloudEdgeStreamBridge:
             "pipe:1",
         ]
 
+        audio_pipe = None
         try:
+            audio_pipe = os.fdopen(audio_write_fd, "wb", buffering=0)
             self._ffmpeg_proc = subprocess.Popen(
                 cmd,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                pass_fds=(audio_read_fd,),
             )
+            os.close(audio_read_fd)
+            audio_read_fd = -1
+            self._audio_pipe = audio_pipe
+            audio_pipe = None
             with self._stream_clients_lock:
                 self._mpegts_bootstrap.clear()
         except FileNotFoundError:
@@ -599,6 +664,11 @@ class CloudEdgeStreamBridge:
             _LOGGER.error("Failed to start ffmpeg for %s: %s", self._serial_number, err)
             self._ffmpeg_proc = None
             return False
+        finally:
+            if audio_read_fd >= 0:
+                os.close(audio_read_fd)
+            if audio_pipe is not None:
+                audio_pipe.close()
 
         self._ffmpeg_reader_thread = threading.Thread(
             target=self._ffmpeg_stdout_reader,
@@ -624,6 +694,12 @@ class CloudEdgeStreamBridge:
             daemon=True,
         )
         self._video_keepalive_thread.start()
+        self._audio_writer_thread = threading.Thread(
+            target=self._audio_writer,
+            name=f"cloudedge_audio_writer_{self._serial_number}",
+            daemon=True,
+        )
+        self._audio_writer_thread.start()
         return True
 
     def _ffmpeg_stdout_reader(self) -> None:
@@ -692,6 +768,31 @@ class CloudEdgeStreamBridge:
             except (BrokenPipeError, OSError, ValueError):
                 return
 
+    def _audio_writer(self) -> None:
+        """Feed real-time G.711 audio, using silence while a camera is waking."""
+        next_write_at = time.monotonic()
+        while True:
+            proc = self._ffmpeg_proc
+            audio_pipe = self._audio_pipe
+            if proc is None or proc.poll() is not None or audio_pipe is None:
+                return
+            try:
+                data = self._audio_queue.get(timeout=0.02)
+            except queue.Empty:
+                if not self._running:
+                    return
+                data = _AUDIO_SILENCE_CHUNK
+
+            try:
+                now = time.monotonic()
+                if next_write_at > now:
+                    time.sleep(next_write_at - now)
+                audio_pipe.write(data)
+                duration = len(data) / _AUDIO_INPUT_SAMPLE_RATE
+                next_write_at = max(next_write_at, time.monotonic()) + duration
+            except (BrokenPipeError, OSError, ValueError):
+                return
+
     def _video_keepalive(self) -> None:
         # CloudEdge sources stall in two cases that would otherwise make the HLS
         # playlist stop advancing and the player give up: a slow cold-start wake
@@ -724,6 +825,19 @@ class CloudEdgeStreamBridge:
             self._video_queue.put_nowait((data, reset_bootstrap))
         except queue.Full:
             _LOGGER.debug("Dropping video frame for %s because ffmpeg is backlogged", self._serial_number)
+
+    def _enqueue_audio(self, data: bytes) -> None:
+        """Queue audio without allowing stale samples to increase latency."""
+        if not data:
+            return
+        try:
+            self._audio_queue.put_nowait(data)
+        except queue.Full:
+            try:
+                self._audio_queue.get_nowait()
+                self._audio_queue.put_nowait(data)
+            except (queue.Empty, queue.Full):
+                pass
 
     def _get_stream_device(self) -> dict | None:
         device = self._coordinator.get_device_for_stream(self._serial_number)
@@ -1132,6 +1246,15 @@ class CloudEdgeStreamBridge:
                         self._latest_keyframe = frame_data
                     self._enqueue_video(frame_data, reset_bootstrap=is_keyframe)
 
+                def on_audio(frame_data: bytes) -> None:
+                    if not frame_data:
+                        return
+                    with self._metrics_lock:
+                        self._audio_frames += 1
+                        self._audio_bytes += len(frame_data)
+                        self._last_audio_at = time.monotonic()
+                    self._enqueue_audio(frame_data)
+
                 def on_login() -> None:
                     nonlocal attempt_logged_in
                     attempt_logged_in = True
@@ -1156,6 +1279,7 @@ class CloudEdgeStreamBridge:
                     create_kwargs = dict(
                         device=device,
                         on_video=on_video,
+                        on_audio=on_audio,
                         on_login=on_login,
                         on_disconnect=on_disconnect,
                         video_id=video_id,
@@ -1372,6 +1496,10 @@ class CloudEdgeStreamManager:
             "stream_substream_video_id": 1,
             "stream_available_video_ids": [0, 1],
             "stream_state": "idle",
+            "stream_audio_codec": "pcm_mulaw/8000",
+            "stream_audio_frames": 0,
+            "stream_audio_bytes": 0,
+            "stream_audio_active": False,
         }
 
     def stop_all(self) -> None:

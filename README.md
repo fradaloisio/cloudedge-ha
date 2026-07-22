@@ -74,7 +74,10 @@ Then restart Home Assistant and check the logs for detailed information.
 
 Supported cameras expose a Home Assistant `camera.*` entity with experimental
 live streaming. Battery-powered CloudEdge cameras wake only for finite live-view
-windows, so the stream may reconnect when the camera goes back to sleep.
+windows, so the stream may reconnect when the camera goes back to sleep. While
+Home Assistant waits, the camera snapshot reports the current connection stage.
+Incoming G.711 camera audio is included in the live stream as browser-compatible
+AAC mono audio.
 
 Each camera also exposes a **Stream profile** select entity:
 
