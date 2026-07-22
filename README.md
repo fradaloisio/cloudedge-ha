@@ -78,9 +78,15 @@ windows, so the stream may reconnect when the camera goes back to sleep.
 
 Each camera also exposes a **Stream profile** select entity:
 
-- `Auto`: starts with `HD` and switches to `SD` if the live stream is degraded.
-- `HD`: uses the camera's main/high-quality stream.
-- `SD`: uses the camera's secondary/lower-bandwidth stream.
+- `Auto`: starts with the camera's advertised default (including adaptive
+  stream `105` when supported) and switches to the lowest-resolution profile
+  if the live stream is degraded.
+- `HD`: uses the camera's advertised main/high-quality stream.
+- `SD`: uses the camera's advertised lowest-resolution stream.
+
+Depending on the model these choices map to legacy IDs `0/1` or to modern
+profile IDs `100`–`105`. The active and available IDs are shown in the camera
+diagnostic attributes.
 
 Use `HD` when you want the best quality and the connection is stable. Use `SD`
 when the stream is choppy, stalls, or the camera is on a slower connection.

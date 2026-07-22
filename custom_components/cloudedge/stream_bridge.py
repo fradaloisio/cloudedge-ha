@@ -20,15 +20,17 @@ import time
 from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
+from .stream_profile_policy import resolve_stream_profile_ids
+
 if TYPE_CHECKING:
     from . import CloudEdgeCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
 _IDLE_TIMEOUT = 45.0
-# The camera grants finite ~15-19s live windows and rate-limits immediate
-# re-establishment (a reconnect within ~1-2s gets no video; waiting ~8s makes
-# every window succeed). Pace window-to-window reconnects by this cooldown.
+# A full reconnect is now a last resort after pycloudedge has attempted an
+# in-session STOP/START recovery. Cameras can rate-limit immediate
+# re-establishment, so keep a short device cooldown between sessions.
 _RECONNECT_COOLDOWN = 8.0
 _MAX_CONSECUTIVE_STREAM_FAILURES = 4
 # Stop re-feeding the held keyframe after this long without any real video, so a
@@ -174,7 +176,10 @@ class CloudEdgeStreamBridge:
         self._p2p_streamer = None
 
         self._stream_profile = STREAM_PROFILE_AUTO
-        self._active_video_id = 0
+        self._active_video_id: int | None = None
+        self._main_video_id = 0
+        self._substream_video_id = 1
+        self._available_video_ids: tuple[int, ...] = (0, 1)
         self._profile_changed = threading.Event()
         self._auto_degraded_windows = 0
         self._auto_substream_failures = 0
@@ -235,7 +240,7 @@ class CloudEdgeStreamBridge:
             return
 
         self._stream_profile = profile
-        self._active_video_id = 1 if profile == STREAM_PROFILE_SUBSTREAM else 0
+        self._active_video_id = None
         self._auto_degraded_windows = 0
         self._auto_substream_failures = 0
         self._profile_changed.set()
@@ -257,10 +262,14 @@ class CloudEdgeStreamBridge:
                 "stream_profile": self._stream_profile,
                 "stream_profile_active": (
                     STREAM_PROFILE_SUBSTREAM
-                    if self._active_video_id == 1
+                    if self._active_video_id == self._substream_video_id
+                    and self._substream_video_id != self._main_video_id
                     else STREAM_PROFILE_MAIN
                 ),
                 "stream_video_id": self._active_video_id,
+                "stream_main_video_id": self._main_video_id,
+                "stream_substream_video_id": self._substream_video_id,
+                "stream_available_video_ids": list(self._available_video_ids),
                 "stream_state": self._stream_state,
                 "stream_clients": self.client_count,
                 "stream_codec": self._video_codec,
@@ -782,7 +791,10 @@ class CloudEdgeStreamBridge:
         if self._stream_profile != STREAM_PROFILE_AUTO:
             return
 
-        if video_id == 1:
+        if (
+            video_id == self._substream_video_id
+            and self._substream_video_id != self._main_video_id
+        ):
             if frames:
                 self._auto_substream_failures = 0
                 return
@@ -793,7 +805,7 @@ class CloudEdgeStreamBridge:
                     "Substream produced no video for %s; returning Auto to main stream",
                     self._serial_number,
                 )
-                self._active_video_id = 0
+                self._active_video_id = self._main_video_id
                 self._auto_degraded_windows = 0
             return
 
@@ -810,7 +822,10 @@ class CloudEdgeStreamBridge:
             return
 
         self._auto_degraded_windows += 1
-        if self._auto_degraded_windows >= _AUTO_FALLBACK_WINDOWS:
+        if (
+            self._substream_video_id != self._main_video_id
+            and self._auto_degraded_windows >= _AUTO_FALLBACK_WINDOWS
+        ):
             _LOGGER.info(
                 "Auto profile switching %s to substream after %d degraded windows "
                 "(%.2f fps, %.2fs max gap)",
@@ -819,8 +834,27 @@ class CloudEdgeStreamBridge:
                 fps,
                 max_frame_gap,
             )
-            self._active_video_id = 1
+            self._active_video_id = self._substream_video_id
             self._auto_substream_failures = 0
+
+    def _resolve_active_video_id(self, device: dict) -> int:
+        """Resolve Auto/HD/SD against the camera's advertised profiles."""
+        main_id, substream_id, available = resolve_stream_profile_ids(device)
+        self._main_video_id = main_id
+        self._substream_video_id = substream_id
+        self._available_video_ids = available
+
+        if self._stream_profile == STREAM_PROFILE_MAIN:
+            selected = main_id
+        elif self._stream_profile == STREAM_PROFILE_SUBSTREAM:
+            selected = substream_id
+        elif self._active_video_id not in (main_id, substream_id):
+            selected = main_id
+        else:
+            selected = self._active_video_id
+
+        self._active_video_id = selected
+        return selected
 
     def _resolve_signaling_server_for_api(self, api) -> tuple[str, int]:
         """Resolve the signaling host from the account region."""
@@ -1030,10 +1064,13 @@ class CloudEdgeStreamBridge:
                         self._reconnect_count += 1
                 self._got_keyframe = False
                 self._profile_changed.clear()
-                video_id = self._active_video_id
+                video_id = self._resolve_active_video_id(device)
                 with self._metrics_lock:
                     self._stream_state = "connecting"
-                    if video_id == 1:
+                    if (
+                        video_id == self._substream_video_id
+                        and self._substream_video_id != self._main_video_id
+                    ):
                         self._pacer_fps = _SUBSTREAM_INITIAL_FPS
 
                 def on_video(frame_data: bytes) -> None:
@@ -1326,6 +1363,10 @@ class CloudEdgeStreamManager:
         return bridge.diagnostics() if bridge else {
             "stream_profile": STREAM_PROFILE_AUTO,
             "stream_profile_active": STREAM_PROFILE_MAIN,
+            "stream_video_id": None,
+            "stream_main_video_id": 0,
+            "stream_substream_video_id": 1,
+            "stream_available_video_ids": [0, 1],
             "stream_state": "idle",
         }
 
