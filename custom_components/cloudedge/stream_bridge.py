@@ -1020,6 +1020,9 @@ class CloudEdgeStreamBridge:
                 )
                 return
 
+            with self._metrics_lock:
+                self._stream_state = "waking"
+            self._coordinator.notify_stream_state_changed()
             prewake_result = self._wait_for_prewake()
             wake_completed = (
                 self._wake_camera_if_needed(device)
@@ -1072,6 +1075,7 @@ class CloudEdgeStreamBridge:
                         and self._substream_video_id != self._main_video_id
                     ):
                         self._pacer_fps = _SUBSTREAM_INITIAL_FPS
+                self._coordinator.notify_stream_state_changed()
 
                 def on_video(frame_data: bytes) -> None:
                     nonlocal attempt_frames, attempt_bytes
