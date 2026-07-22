@@ -23,56 +23,55 @@ ALARM_IMAGE_MAX_AGE = 3600  # show alarm snapshot for up to 1 hour
 _CONNECTING_STREAM_STATES = {"starting", "waking", "connecting", "reconnecting"}
 
 
-@lru_cache(maxsize=len(_CONNECTING_STREAM_STATES))
-def _render_stream_status_image(stream_state: str) -> bytes:
-    """Render a camera placeholder that explains live-stream startup."""
-    from PIL import Image, ImageDraw, ImageFont
+@lru_cache(maxsize=1)
+def _render_stream_loading_gif() -> bytes:
+    """Render a language-neutral animated loading indicator."""
+    import math
 
-    labels = {
-        "starting": ("Avvio streaming", "Preparazione della connessione..."),
-        "waking": (
-            "Risveglio telecamera",
-            "La telecamera a batteria si sta attivando...",
-        ),
-        "connecting": ("Connessione in corso", "Negoziazione del flusso video P2P..."),
-        "reconnecting": ("Riconnessione", "Ripristino del flusso video..."),
-    }
-    title, detail = labels.get(stream_state, labels["connecting"])
+    from PIL import Image, ImageDraw
 
-    image = Image.new("RGB", (640, 360), "#111827")
-    draw = ImageDraw.Draw(image)
-    try:
-        title_font = ImageFont.truetype("DejaVuSans.ttf", 30)
-        detail_font = ImageFont.truetype("DejaVuSans.ttf", 17)
-    except OSError:
-        title_font = ImageFont.load_default()
-        detail_font = title_font
-
-    # A simple activity glyph remains legible in both the dashboard card and
-    # the more-info dialog, unlike the previous frozen camera snapshot.
-    center_x = image.width // 2
-    for index, color in enumerate(("#38bdf8", "#0ea5e9", "#0369a1")):
-        x = center_x - 34 + index * 34
-        draw.ellipse((x - 7, 91, x + 7, 105), fill=color)
-
-    title_box = draw.textbbox((0, 0), title, font=title_font)
-    detail_box = draw.textbbox((0, 0), detail, font=detail_font)
-    draw.text(
-        ((image.width - (title_box[2] - title_box[0])) / 2, 140),
-        title,
-        fill="#f8fafc",
-        font=title_font,
+    frames = []
+    width, height = 640, 360
+    center_x, center_y = width // 2, height // 2
+    colors = (
+        "#38bdf8",
+        "#259fd4",
+        "#1786bd",
+        "#0e749f",
+        "#075985",
+        "#164e63",
+        "#1f4656",
+        "#263f4b",
+        "#2b3941",
+        "#30353a",
+        "#2b3941",
+        "#263f4b",
     )
-    draw.text(
-        ((image.width - (detail_box[2] - detail_box[0])) / 2, 195),
-        detail,
-        fill="#94a3b8",
-        font=detail_font,
-    )
-    draw.text((24, 322), "CloudEdge", fill="#64748b", font=detail_font)
+    for frame_index in range(len(colors)):
+        frame = Image.new("RGB", (width, height), "#111827")
+        draw = ImageDraw.Draw(frame)
+        for dot_index in range(len(colors)):
+            angle = (2 * math.pi * dot_index / len(colors)) - (math.pi / 2)
+            x = center_x + int(math.cos(angle) * 48)
+            y = center_y + int(math.sin(angle) * 48)
+            color = colors[(dot_index - frame_index) % len(colors)]
+            radius = 7
+            draw.ellipse(
+                (x - radius, y - radius, x + radius, y + radius),
+                fill=color,
+            )
+        frames.append(frame)
 
     output = io.BytesIO()
-    image.save(output, format="JPEG", quality=88, optimize=True)
+    frames[0].save(
+        output,
+        format="GIF",
+        save_all=True,
+        append_images=frames[1:],
+        duration=80,
+        loop=0,
+        optimize=True,
+    )
     return output.getvalue()
 
 
@@ -123,7 +122,6 @@ class CloudEdgeCamera(CoordinatorEntity[CloudEdgeCoordinator], Camera):
 
     _attr_has_entity_name = True
     _attr_supported_features = CameraEntityFeature.ON_OFF | CameraEntityFeature.STREAM
-    _attr_content_type = "image/jpeg"
 
     def __init__(
         self,
@@ -289,7 +287,10 @@ class CloudEdgeCamera(CoordinatorEntity[CloudEdgeCoordinator], Camera):
             self._serial_number
         ).get("stream_state")
         if stream_state in _CONNECTING_STREAM_STATES:
-            return _render_stream_status_image(str(stream_state))
+            self.content_type = "image/gif"
+            return _render_stream_loading_gif()
+
+        self.content_type = "image/jpeg"
 
         device_data = (
             self.coordinator.data.get(self._serial_number)
@@ -320,6 +321,9 @@ class CloudEdgeCamera(CoordinatorEntity[CloudEdgeCoordinator], Camera):
             ) as resp:
                 resp.raise_for_status()
                 data = await resp.read()
+                response_type = resp.headers.get("Content-Type", "").split(";", 1)[0]
+                if response_type.startswith("image/"):
+                    self.content_type = response_type
                 self._last_image = data
                 return data
         except Exception as err:
