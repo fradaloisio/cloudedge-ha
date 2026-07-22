@@ -34,6 +34,10 @@ _IDLE_TIMEOUT = 45.0
 # re-establishment, so keep a short device cooldown between sessions.
 _RECONNECT_COOLDOWN = 8.0
 _MAX_CONSECUTIVE_STREAM_FAILURES = 4
+# Home Assistant's stream worker reconnects its TCP input immediately after an
+# error.  Keep the failure state across those new local clients so they cannot
+# wake the battery camera and enable live mode forever.
+_FAILED_SESSION_COOLDOWN = 90.0
 # Stop re-feeding the held keyframe after this long without any real video, so a
 # camera that has genuinely gone offline surfaces as a stalled/errored stream
 # instead of an indefinitely frozen "live" image.
@@ -206,6 +210,7 @@ class CloudEdgeStreamBridge:
         self._audio_bytes = 0
         self._last_audio_at = 0.0
         self._last_error: str | None = None
+        self._failure_cooldown_until = 0.0
 
         self._last_request_time = 0.0
         self._last_client_time = 0.0
@@ -301,6 +306,10 @@ class CloudEdgeStreamBridge:
                     and time.monotonic() - self._last_audio_at < 5.0
                 ),
                 "stream_last_error": self._last_error,
+                "stream_retry_cooldown": round(
+                    max(0.0, self._failure_cooldown_until - time.monotonic()),
+                    1,
+                ),
             }
 
     def ensure_started(self) -> str | None:
@@ -516,6 +525,21 @@ class CloudEdgeStreamBridge:
             if self._running:
                 return True
             if self._stream_server is None:
+                return False
+
+            cooldown_remaining = self._failure_cooldown_until - time.monotonic()
+            if cooldown_remaining > 0:
+                with self._metrics_lock:
+                    self._stream_state = "retry_cooldown"
+                    self._last_error = (
+                        "Live stream temporarily paused after repeated connection "
+                        f"failures; retry in {cooldown_remaining:.0f}s"
+                    )
+                _LOGGER.debug(
+                    "Rejecting automatic stream reconnect for %s during %.0fs cooldown",
+                    self._serial_number,
+                    cooldown_remaining,
+                )
                 return False
 
             # HA may ask for stream_source() speculatively. Wake only after its
@@ -1258,6 +1282,7 @@ class CloudEdgeStreamBridge:
                 def on_login() -> None:
                     nonlocal attempt_logged_in
                     attempt_logged_in = True
+                    self._failure_cooldown_until = 0.0
                     self._last_online_confirmation = time.monotonic()
                     self._coordinator.set_runtime_connection_status(
                         self._serial_number,
@@ -1347,11 +1372,21 @@ class CloudEdgeStreamBridge:
                 else:
                     consecutive_failures += 1
                     if consecutive_failures >= _MAX_CONSECUTIVE_STREAM_FAILURES:
+                        self._failure_cooldown_until = (
+                            time.monotonic() + _FAILED_SESSION_COOLDOWN
+                        )
+                        with self._metrics_lock:
+                            self._stream_state = "retry_cooldown"
+                            self._last_error = (
+                                "Live stream failed repeatedly; automatic retries "
+                                f"paused for {_FAILED_SESSION_COOLDOWN:.0f}s"
+                            )
                         _LOGGER.warning(
-                            "Live stream for %s failed %d times in a row; giving up "
-                            "until a new stream request",
+                            "Live stream for %s failed %d times in a row; pausing "
+                            "automatic retries for %.0fs",
                             self._serial_number,
                             consecutive_failures,
+                            _FAILED_SESSION_COOLDOWN,
                         )
                         return
 
