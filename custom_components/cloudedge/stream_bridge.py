@@ -14,6 +14,7 @@ import inspect
 import logging
 import os
 import queue
+import select
 import socket
 import subprocess
 import threading
@@ -37,7 +38,7 @@ _MAX_CONSECUTIVE_STREAM_FAILURES = 4
 # Home Assistant's stream worker reconnects its TCP input immediately after an
 # error.  Keep the failure state across those new local clients so they cannot
 # wake the battery camera and enable live mode forever.
-_FAILED_SESSION_COOLDOWN = 90.0
+_FAILED_SESSION_COOLDOWN = 600.0
 # Stop re-feeding the held keyframe after this long without any real video, so a
 # camera that has genuinely gone offline surfaces as a stalled/errored stream
 # instead of an indefinitely frozen "live" image.
@@ -211,6 +212,7 @@ class CloudEdgeStreamBridge:
         self._last_audio_at = 0.0
         self._last_error: str | None = None
         self._failure_cooldown_until = 0.0
+        self._consecutive_stream_failures = 0
 
         self._last_request_time = 0.0
         self._last_client_time = 0.0
@@ -234,7 +236,27 @@ class CloudEdgeStreamBridge:
     def client_count(self) -> int:
         """Return the number of connected local MPEG-TS clients."""
         with self._stream_clients_lock:
+            self._prune_disconnected_clients_locked()
             return len(self._stream_clients)
+
+    def _prune_disconnected_clients_locked(self) -> None:
+        """Remove HA TCP consumers that closed before media was available."""
+        dead: list[socket.socket] = []
+        for client in self._stream_clients:
+            try:
+                readable, _, exceptional = select.select([client], [], [client], 0)
+                if exceptional:
+                    dead.append(client)
+                elif readable and not client.recv(1, socket.MSG_PEEK):
+                    dead.append(client)
+            except (ConnectionError, OSError, ValueError):
+                dead.append(client)
+        for client in dead:
+            self._stream_clients.remove(client)
+            try:
+                client.close()
+            except OSError:
+                pass
 
     @property
     def stream_source(self) -> str | None:
@@ -258,6 +280,8 @@ class CloudEdgeStreamBridge:
         self._active_video_id = None
         self._auto_degraded_windows = 0
         self._auto_substream_failures = 0
+        self._consecutive_stream_failures = 0
+        self._failure_cooldown_until = 0.0
         self._profile_changed.set()
         streamer = self._p2p_streamer
         if streamer is not None:
@@ -1137,7 +1161,6 @@ class CloudEdgeStreamBridge:
         streamer._cloudedge_status_retry_patch = True
 
     def _stream_worker(self) -> None:
-        consecutive_failures = 0
         device: dict | None = None
         bridge_owns_live_switch = False
         attempt_number = 0
@@ -1283,6 +1306,7 @@ class CloudEdgeStreamBridge:
                     nonlocal attempt_logged_in
                     attempt_logged_in = True
                     self._failure_cooldown_until = 0.0
+                    self._consecutive_stream_failures = 0
                     self._last_online_confirmation = time.monotonic()
                     self._coordinator.set_runtime_connection_status(
                         self._serial_number,
@@ -1354,24 +1378,14 @@ class CloudEdgeStreamBridge:
                 )
                 self._coordinator.notify_stream_state_changed()
 
-                # Keep the local listener available for the idle grace period,
-                # but do not consume battery by opening another P2P window when
-                # Home Assistant no longer has an active MPEG-TS consumer.
-                if not self.client_count:
-                    return
-                if not self._should_keep_running():
-                    return
-
-                # A finished window or a cooldown-collided attempt both land here.
-                # The camera rate-limits back-to-back sessions, so a single failed
-                # attempt is expected — wait the cooldown and re-establish a fresh
-                # window rather than giving up. Bail only after repeated failures
-                # (camera genuinely offline / asleep).
                 if attempt_logged_in:
-                    consecutive_failures = 0
+                    self._consecutive_stream_failures = 0
                 else:
-                    consecutive_failures += 1
-                    if consecutive_failures >= _MAX_CONSECUTIVE_STREAM_FAILURES:
+                    self._consecutive_stream_failures += 1
+                    if (
+                        self._consecutive_stream_failures
+                        >= _MAX_CONSECUTIVE_STREAM_FAILURES
+                    ):
                         self._failure_cooldown_until = (
                             time.monotonic() + _FAILED_SESSION_COOLDOWN
                         )
@@ -1385,11 +1399,24 @@ class CloudEdgeStreamBridge:
                             "Live stream for %s failed %d times in a row; pausing "
                             "automatic retries for %.0fs",
                             self._serial_number,
-                            consecutive_failures,
+                            self._consecutive_stream_failures,
                             _FAILED_SESSION_COOLDOWN,
                         )
                         return
 
+                # Keep the local listener available for the idle grace period,
+                # but do not consume battery by opening another P2P window when
+                # Home Assistant no longer has an active MPEG-TS consumer.
+                if not self.client_count:
+                    return
+                if not self._should_keep_running():
+                    return
+
+                # A finished window or a cooldown-collided attempt both land here.
+                # The camera rate-limits back-to-back sessions, so a single failed
+                # attempt is expected — wait the cooldown and re-establish a fresh
+                # window rather than giving up. Bail only after repeated failures
+                # (camera genuinely offline / asleep).
                 if self._profile_changed.is_set():
                     continue
 
