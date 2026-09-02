@@ -5,7 +5,7 @@ This module keeps the Home Assistant camera entity thin. The entity exposes a
 
 * CloudEdge P2P streaming via ``pycloudedge``
 * H.264/HEVC bitstream inspection
-* ``ffmpeg`` remuxing from raw video into MPEG-TS
+* ``ffmpeg`` muxing raw video and G.711 audio into MPEG-TS
 * a tiny local TCP server that Home Assistant can open via ``tcp://...``
 """
 from __future__ import annotations
@@ -16,6 +16,7 @@ import itertools
 import logging
 import os
 import queue
+import select
 import socket
 import subprocess
 import threading
@@ -23,17 +24,23 @@ import time
 from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
+from .stream_profile_policy import resolve_stream_profile_ids
+
 if TYPE_CHECKING:
     from . import CloudEdgeCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
 _IDLE_TIMEOUT = 45.0
-# The camera grants finite ~15-19s live windows and rate-limits immediate
-# re-establishment (a reconnect within ~1-2s gets no video; waiting ~8s makes
-# every window succeed). Pace window-to-window reconnects by this cooldown.
+# A full reconnect is now a last resort after pycloudedge has attempted an
+# in-session STOP/START recovery. Cameras can rate-limit immediate
+# re-establishment, so keep a short device cooldown between sessions.
 _RECONNECT_COOLDOWN = 8.0
 _MAX_CONSECUTIVE_STREAM_FAILURES = 4
+# Home Assistant's stream worker reconnects its TCP input immediately after an
+# error.  Keep the failure state across those new local clients so they cannot
+# wake the battery camera and enable live mode forever.
+_FAILED_SESSION_COOLDOWN = 600.0
 # Stop re-feeding the held keyframe after this long without any real video, so a
 # camera that has genuinely gone offline surfaces as a stalled/errored stream
 # instead of an indefinitely frozen "live" image.
@@ -236,7 +243,10 @@ class CloudEdgeStreamBridge:
         self._p2p_streamer = None
 
         self._stream_profile = STREAM_PROFILE_AUTO
-        self._active_video_id = 0
+        self._active_video_id: int | None = None
+        self._main_video_id = 0
+        self._substream_video_id = 1
+        self._available_video_ids: tuple[int, ...] = (0, 1)
         self._profile_changed = threading.Event()
         self._auto_degraded_windows = 0
         self._auto_substream_failures = 0
@@ -252,7 +262,12 @@ class CloudEdgeStreamBridge:
         self._last_session_fps = 0.0
         self._last_max_frame_gap = 0.0
         self._pacer_fps = _PACER_MAX_FPS
+        self._audio_frames = 0
+        self._audio_bytes = 0
+        self._last_audio_at = 0.0
         self._last_error: str | None = None
+        self._failure_cooldown_until = 0.0
+        self._consecutive_stream_failures = 0
 
         self._last_request_time = 0.0
         self._last_client_time = 0.0
@@ -276,7 +291,27 @@ class CloudEdgeStreamBridge:
     def client_count(self) -> int:
         """Return the number of connected local MPEG-TS clients."""
         with self._stream_clients_lock:
+            self._prune_disconnected_clients_locked()
             return len(self._stream_clients)
+
+    def _prune_disconnected_clients_locked(self) -> None:
+        """Remove HA TCP consumers that closed before media was available."""
+        dead: list[socket.socket] = []
+        for client in self._stream_clients:
+            try:
+                readable, _, exceptional = select.select([client], [], [client], 0)
+                if exceptional:
+                    dead.append(client)
+                elif readable and not client.recv(1, socket.MSG_PEEK):
+                    dead.append(client)
+            except (ConnectionError, OSError, ValueError):
+                dead.append(client)
+        for client in dead:
+            self._stream_clients.remove(client)
+            try:
+                client.close()
+            except OSError:
+                pass
 
     @property
     def stream_source(self) -> str | None:
@@ -297,9 +332,11 @@ class CloudEdgeStreamBridge:
             return
 
         self._stream_profile = profile
-        self._active_video_id = 1 if profile == STREAM_PROFILE_SUBSTREAM else 0
+        self._active_video_id = None
         self._auto_degraded_windows = 0
         self._auto_substream_failures = 0
+        self._consecutive_stream_failures = 0
+        self._failure_cooldown_until = 0.0
         self._profile_changed.set()
         streamer = self._p2p_streamer
         if streamer is not None:
@@ -319,10 +356,14 @@ class CloudEdgeStreamBridge:
                 "stream_profile": self._stream_profile,
                 "stream_profile_active": (
                     STREAM_PROFILE_SUBSTREAM
-                    if self._active_video_id == 1
+                    if self._active_video_id == self._substream_video_id
+                    and self._substream_video_id != self._main_video_id
                     else STREAM_PROFILE_MAIN
                 ),
                 "stream_video_id": self._active_video_id,
+                "stream_main_video_id": self._main_video_id,
+                "stream_substream_video_id": self._substream_video_id,
+                "stream_available_video_ids": list(self._available_video_ids),
                 "stream_state": self._stream_state,
                 "stream_clients": self.client_count,
                 "stream_codec": self._video_codec,
@@ -336,7 +377,18 @@ class CloudEdgeStreamBridge:
                 "stream_last_fps": round(self._last_session_fps, 2),
                 "stream_last_max_gap": round(self._last_max_frame_gap, 2),
                 "stream_pacer_fps": round(self._pacer_fps, 2),
+                "stream_audio_codec": "pcm_mulaw/8000",
+                "stream_audio_frames": self._audio_frames,
+                "stream_audio_bytes": self._audio_bytes,
+                "stream_audio_active": bool(
+                    self._last_audio_at
+                    and time.monotonic() - self._last_audio_at < 5.0
+                ),
                 "stream_last_error": self._last_error,
+                "stream_retry_cooldown": round(
+                    max(0.0, self._failure_cooldown_until - time.monotonic()),
+                    1,
+                ),
             }
 
     def ensure_started(self) -> str | None:
@@ -473,7 +525,6 @@ class CloudEdgeStreamBridge:
                 self._video_queue.get_nowait()
             except queue.Empty:
                 break
-
         self._cleanup_audio_fifo(self._audio_fifo_path)
         self._audio_fifo_path = None
         with self._audio_buffer_lock:
@@ -566,6 +617,21 @@ class CloudEdgeStreamBridge:
             if self._stream_server is None:
                 return False
 
+            cooldown_remaining = self._failure_cooldown_until - time.monotonic()
+            if cooldown_remaining > 0:
+                with self._metrics_lock:
+                    self._stream_state = "retry_cooldown"
+                    self._last_error = (
+                        "Live stream temporarily paused after repeated connection "
+                        f"failures; retry in {cooldown_remaining:.0f}s"
+                    )
+                _LOGGER.debug(
+                    "Rejecting automatic stream reconnect for %s during %.0fs cooldown",
+                    self._serial_number,
+                    cooldown_remaining,
+                )
+                return False
+
             # HA may ask for stream_source() speculatively. Wake only after its
             # stream worker has opened the local TCP source, which proves there
             # is a real consumer for this camera.
@@ -577,6 +643,9 @@ class CloudEdgeStreamBridge:
             self._pending_param_sets = None
             with self._metrics_lock:
                 self._stream_state = "starting"
+                self._audio_frames = 0
+                self._audio_bytes = 0
+                self._last_audio_at = 0.0
                 self._last_error = None
             self._worker_thread = threading.Thread(
                 target=self._stream_worker,
@@ -716,7 +785,6 @@ class CloudEdgeStreamBridge:
             self._ffmpeg_proc = None
             self._cleanup_audio_fifo(audio_fifo)
             return False
-
         self._audio_fifo_path = audio_fifo
 
         # Bind every helper thread to THIS ffmpeg process. Re-reading
@@ -1045,7 +1113,10 @@ class CloudEdgeStreamBridge:
         if self._stream_profile != STREAM_PROFILE_AUTO:
             return
 
-        if video_id == 1:
+        if (
+            video_id == self._substream_video_id
+            and self._substream_video_id != self._main_video_id
+        ):
             if frames:
                 self._auto_substream_failures = 0
                 return
@@ -1056,7 +1127,7 @@ class CloudEdgeStreamBridge:
                     "Substream produced no video for %s; returning Auto to main stream",
                     self._serial_number,
                 )
-                self._active_video_id = 0
+                self._active_video_id = self._main_video_id
                 self._auto_degraded_windows = 0
             return
 
@@ -1073,7 +1144,10 @@ class CloudEdgeStreamBridge:
             return
 
         self._auto_degraded_windows += 1
-        if self._auto_degraded_windows >= _AUTO_FALLBACK_WINDOWS:
+        if (
+            self._substream_video_id != self._main_video_id
+            and self._auto_degraded_windows >= _AUTO_FALLBACK_WINDOWS
+        ):
             _LOGGER.info(
                 "Auto profile switching %s to substream after %d degraded windows "
                 "(%.2f fps, %.2fs max gap)",
@@ -1082,8 +1156,27 @@ class CloudEdgeStreamBridge:
                 fps,
                 max_frame_gap,
             )
-            self._active_video_id = 1
+            self._active_video_id = self._substream_video_id
             self._auto_substream_failures = 0
+
+    def _resolve_active_video_id(self, device: dict) -> int:
+        """Resolve Auto/HD/SD against the camera's advertised profiles."""
+        main_id, substream_id, available = resolve_stream_profile_ids(device)
+        self._main_video_id = main_id
+        self._substream_video_id = substream_id
+        self._available_video_ids = available
+
+        if self._stream_profile == STREAM_PROFILE_MAIN:
+            selected = main_id
+        elif self._stream_profile == STREAM_PROFILE_SUBSTREAM:
+            selected = substream_id
+        elif self._active_video_id not in (main_id, substream_id):
+            selected = main_id
+        else:
+            selected = self._active_video_id
+
+        self._active_video_id = selected
+        return selected
 
     def _resolve_signaling_server_for_api(self, api) -> tuple[str, int]:
         """Resolve the signaling host from the account region."""
@@ -1253,6 +1346,9 @@ class CloudEdgeStreamBridge:
                 )
                 return
 
+            with self._metrics_lock:
+                self._stream_state = "waking"
+            self._coordinator.notify_stream_state_changed()
             prewake_result = self._wait_for_prewake()
             wake_completed = (
                 self._wake_camera_if_needed(device)
@@ -1300,11 +1396,15 @@ class CloudEdgeStreamBridge:
                 # them into a new attempt (the profile may have switched).
                 self._pending_param_sets = None
                 self._profile_changed.clear()
-                video_id = self._active_video_id
+                video_id = self._resolve_active_video_id(device)
                 with self._metrics_lock:
                     self._stream_state = "connecting"
-                    if video_id == 1:
+                    if (
+                        video_id == self._substream_video_id
+                        and self._substream_video_id != self._main_video_id
+                    ):
                         self._pacer_fps = _SUBSTREAM_INITIAL_FPS
+                self._coordinator.notify_stream_state_changed()
 
                 def on_video(frame_data: bytes) -> None:
                     nonlocal attempt_frames, attempt_bytes
@@ -1390,6 +1490,10 @@ class CloudEdgeStreamBridge:
                         return
                     if not audio_data:
                         return
+                    with self._metrics_lock:
+                        self._audio_frames += 1
+                        self._audio_bytes += len(audio_data)
+                        self._last_audio_at = time.monotonic()
                     with self._audio_buffer_lock:
                         self._audio_buffer.extend(audio_data)
                         excess = len(self._audio_buffer) - _AUDIO_BUFFER_MAX_BYTES
@@ -1399,6 +1503,8 @@ class CloudEdgeStreamBridge:
                 def on_login() -> None:
                     nonlocal attempt_logged_in
                     attempt_logged_in = True
+                    self._failure_cooldown_until = 0.0
+                    self._consecutive_stream_failures = 0
                     self._last_online_confirmation = time.monotonic()
                     self._coordinator.set_runtime_connection_status(
                         self._serial_number,
@@ -1420,6 +1526,7 @@ class CloudEdgeStreamBridge:
                     create_kwargs = dict(
                         device=device,
                         on_video=on_video,
+                        on_audio=on_audio,
                         on_login=on_login,
                         on_disconnect=on_disconnect,
                         video_id=video_id,
@@ -1471,6 +1578,32 @@ class CloudEdgeStreamBridge:
                 )
                 self._coordinator.notify_stream_state_changed()
 
+                if attempt_logged_in:
+                    self._consecutive_stream_failures = 0
+                else:
+                    self._consecutive_stream_failures += 1
+                    if (
+                        self._consecutive_stream_failures
+                        >= _MAX_CONSECUTIVE_STREAM_FAILURES
+                    ):
+                        self._failure_cooldown_until = (
+                            time.monotonic() + _FAILED_SESSION_COOLDOWN
+                        )
+                        with self._metrics_lock:
+                            self._stream_state = "retry_cooldown"
+                            self._last_error = (
+                                "Live stream failed repeatedly; automatic retries "
+                                f"paused for {_FAILED_SESSION_COOLDOWN:.0f}s"
+                            )
+                        _LOGGER.warning(
+                            "Live stream for %s failed %d times in a row; pausing "
+                            "automatic retries for %.0fs",
+                            self._serial_number,
+                            self._consecutive_stream_failures,
+                            _FAILED_SESSION_COOLDOWN,
+                        )
+                        return
+
                 # Keep the local listener available for the idle grace period,
                 # but do not consume battery by opening another P2P window when
                 # Home Assistant no longer has an active MPEG-TS consumer.
@@ -1484,19 +1617,6 @@ class CloudEdgeStreamBridge:
                 # attempt is expected — wait the cooldown and re-establish a fresh
                 # window rather than giving up. Bail only after repeated failures
                 # (camera genuinely offline / asleep).
-                if attempt_logged_in:
-                    consecutive_failures = 0
-                else:
-                    consecutive_failures += 1
-                    if consecutive_failures >= _MAX_CONSECUTIVE_STREAM_FAILURES:
-                        _LOGGER.warning(
-                            "Live stream for %s failed %d times in a row; giving up "
-                            "until a new stream request",
-                            self._serial_number,
-                            consecutive_failures,
-                        )
-                        return
-
                 if self._profile_changed.is_set():
                     continue
 
@@ -1639,7 +1759,15 @@ class CloudEdgeStreamManager:
         return bridge.diagnostics() if bridge else {
             "stream_profile": STREAM_PROFILE_AUTO,
             "stream_profile_active": STREAM_PROFILE_MAIN,
+            "stream_video_id": None,
+            "stream_main_video_id": 0,
+            "stream_substream_video_id": 1,
+            "stream_available_video_ids": [0, 1],
             "stream_state": "idle",
+            "stream_audio_codec": "pcm_mulaw/8000",
+            "stream_audio_frames": 0,
+            "stream_audio_bytes": 0,
+            "stream_audio_active": False,
         }
 
     def stop_all(self) -> None:

@@ -1,8 +1,10 @@
 """Camera platform for CloudEdge integration."""
 from __future__ import annotations
 
+import io
 import logging
 import time
+from functools import lru_cache
 from typing import Any
 
 from homeassistant.components.camera import Camera, CameraEntityFeature
@@ -18,6 +20,59 @@ from .const import DOMAIN
 _LOGGER = logging.getLogger(__name__)
 
 ALARM_IMAGE_MAX_AGE = 3600  # show alarm snapshot for up to 1 hour
+_CONNECTING_STREAM_STATES = {"starting", "waking", "connecting", "reconnecting"}
+
+
+@lru_cache(maxsize=1)
+def _render_stream_loading_gif() -> bytes:
+    """Render a language-neutral animated loading indicator."""
+    import math
+
+    from PIL import Image, ImageDraw
+
+    frames = []
+    width, height = 640, 360
+    center_x, center_y = width // 2, height // 2
+    colors = (
+        "#38bdf8",
+        "#259fd4",
+        "#1786bd",
+        "#0e749f",
+        "#075985",
+        "#164e63",
+        "#1f4656",
+        "#263f4b",
+        "#2b3941",
+        "#30353a",
+        "#2b3941",
+        "#263f4b",
+    )
+    for frame_index in range(len(colors)):
+        frame = Image.new("RGB", (width, height), "#111827")
+        draw = ImageDraw.Draw(frame)
+        for dot_index in range(len(colors)):
+            angle = (2 * math.pi * dot_index / len(colors)) - (math.pi / 2)
+            x = center_x + int(math.cos(angle) * 48)
+            y = center_y + int(math.sin(angle) * 48)
+            color = colors[(dot_index - frame_index) % len(colors)]
+            radius = 7
+            draw.ellipse(
+                (x - radius, y - radius, x + radius, y + radius),
+                fill=color,
+            )
+        frames.append(frame)
+
+    output = io.BytesIO()
+    frames[0].save(
+        output,
+        format="GIF",
+        save_all=True,
+        append_images=frames[1:],
+        duration=80,
+        loop=0,
+        optimize=True,
+    )
+    return output.getvalue()
 
 
 async def async_setup_entry(
@@ -70,7 +125,6 @@ class CloudEdgeCamera(CoordinatorEntity[CloudEdgeCoordinator], Camera):
 
     _attr_has_entity_name = True
     _attr_supported_features = CameraEntityFeature.ON_OFF | CameraEntityFeature.STREAM
-    _attr_content_type = "image/jpeg"
 
     def __init__(
         self,
@@ -232,6 +286,15 @@ class CloudEdgeCamera(CoordinatorEntity[CloudEdgeCoordinator], Camera):
         Prefers the latest alarm snapshot (decrypted jpgx3) when available,
         otherwise falls back to the device icon URL.
         """
+        stream_state = self.coordinator.get_stream_diagnostics(
+            self._serial_number
+        ).get("stream_state")
+        if stream_state in _CONNECTING_STREAM_STATES:
+            self.content_type = "image/gif"
+            return _render_stream_loading_gif()
+
+        self.content_type = "image/jpeg"
+
         device_data = (
             self.coordinator.data.get(self._serial_number)
             if self.coordinator.data
@@ -261,6 +324,9 @@ class CloudEdgeCamera(CoordinatorEntity[CloudEdgeCoordinator], Camera):
             ) as resp:
                 resp.raise_for_status()
                 data = await resp.read()
+                response_type = resp.headers.get("Content-Type", "").split(";", 1)[0]
+                if response_type.startswith("image/"):
+                    self.content_type = response_type
                 self._last_image = data
                 return data
         except Exception as err:

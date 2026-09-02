@@ -1,13 +1,13 @@
 {
   "domain": "cloudedge",
   "name": "CloudEdge",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "documentation": "https://github.com/fradaloisio/cloudedge-ha",
   "issue_tracker": "https://github.com/fradaloisio/cloudedge-ha/issues",
   "dependencies": ["stream"],
   "codeowners": ["@fradaloisio"],
   "requirements": [
-    "pycloudedge==0.1.7",
+    "pycloudedge>=0.1.8.dev0,<0.2.0",
     "paho-mqtt>=2.0.0",
     "pycryptodome>=3.15.0"
   ],
