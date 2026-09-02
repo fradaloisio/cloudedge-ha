@@ -7,7 +7,7 @@
   "dependencies": ["stream"],
   "codeowners": ["@fradaloisio"],
   "requirements": [
-    "pycloudedge>=0.1.8.dev0,<0.2.0",
+    "pycloudedge==0.1.8",
     "paho-mqtt>=2.0.0",
     "pycryptodome>=3.15.0"
   ],
