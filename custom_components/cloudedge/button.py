@@ -126,14 +126,12 @@ class CloudEdgeRefreshButton(CoordinatorEntity, ButtonEntity):
             # Update refresh timestamp
             self._last_refresh = datetime.now()
             
-            # Call the refresh parameters service
-            await self.hass.services.async_call(
-                DOMAIN,
-                "refresh_parameters",
-                {"device_name": self._device_name},
-                blocking=True,  # Wait for completion to provide user feedback
+            success = await self.coordinator.async_refresh_device_config(
+                self._device_name, serial_number=self._device_sn
             )
-            
+            if not success:
+                raise HomeAssistantError("Failed to refresh device parameters")
+
             _LOGGER.info(f"Successfully triggered parameter refresh for {self._device_name}")
             
             # Update the entity state to reflect the new attributes

@@ -184,7 +184,6 @@ class CloudEdgeCamera(CoordinatorEntity[CloudEdgeCoordinator], Camera):
         attributes = {
             "serial_number": self._serial_number,
             "device_type": device_data.get("type"),
-            "host_key": device_data.get("host_key"),
             "last_seen": device_data.get("last_seen"),
         }
 
@@ -220,33 +219,20 @@ class CloudEdgeCamera(CoordinatorEntity[CloudEdgeCoordinator], Camera):
         return await self.coordinator.async_get_stream_source(self._serial_number)
 
     async def async_turn_on(self) -> None:
-        """Turn on camera."""
-        # For CloudEdge cameras, "turning on" might mean enabling motion detection
-        # or turning on the front light, depending on the device capabilities
-        try:
-            await self.hass.async_add_executor_job(
-                self.coordinator.client.set_device_parameter,
-                self._device_info.get("name"),
-                "MOTION_DET_ENABLE",
-                1,
-            )
-            await self.coordinator.async_request_refresh()
-        except Exception as e:
-            _LOGGER.error("Failed to turn on camera %s: %s", self._attr_name, e)
+        """Enable motion detection on this camera."""
+        from cloudedge.iot_parameters import get_parameter_code_by_name
+
+        await self.coordinator.async_set_device_parameter(
+            self._serial_number, get_parameter_code_by_name("MOTION_DET_ENABLE"), 1
+        )
 
     async def async_turn_off(self) -> None:
-        """Turn off camera."""
-        # For CloudEdge cameras, "turning off" might mean disabling motion detection
-        try:
-            await self.hass.async_add_executor_job(
-                self.coordinator.client.set_device_parameter,
-                self._device_info.get("name"),
-                "MOTION_DET_ENABLE",
-                0,
-            )
-            await self.coordinator.async_request_refresh()
-        except Exception as e:
-            _LOGGER.error("Failed to turn off camera %s: %s", self._attr_name, e)
+        """Disable motion detection on this camera."""
+        from cloudedge.iot_parameters import get_parameter_code_by_name
+
+        await self.coordinator.async_set_device_parameter(
+            self._serial_number, get_parameter_code_by_name("MOTION_DET_ENABLE"), 0
+        )
 
     def _get_device_icon_url(self) -> str | None:
         """Return the product icon URL stored in coordinator data."""
