@@ -10,13 +10,14 @@ import asyncio
 import logging
 import os
 import time
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
+from functools import partial
 from typing import Dict, Any
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
+from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady, HomeAssistantError
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .const import (
@@ -94,13 +95,10 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # unload also runs on every reload, and CloudEdge allows one active
     # session per account — wiping the cache forces a fresh login that
     # logs out the vendor app. Cache removal lives in async_remove_entry.
-    if entry.entry_id in hass.data[DOMAIN]:
-        coordinator = hass.data[DOMAIN][entry.entry_id]
+    if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
+        coordinator = hass.data[DOMAIN].pop(entry.entry_id)
         await hass.async_add_executor_job(coordinator._stop_mqtt)
         await hass.async_add_executor_job(coordinator.stop_streams)
-
-    if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
-        hass.data[DOMAIN].pop(entry.entry_id)
         # Services are domain-wide: remove them only with the last entry
         if not hass.data[DOMAIN]:
             await async_unload_services(hass)
@@ -165,6 +163,7 @@ class CloudEdgeCoordinator(DataUpdateCoordinator):
         self._force_auth_refresh = False
         self._setup_complete = False
         self._last_updated_device = None  # Track which device was last updated
+        self._last_update_time: datetime | None = None
         self._mqtt_listener = None
         self._stream_manager = CloudEdgeStreamManager(self)
         
@@ -176,6 +175,7 @@ class CloudEdgeCoordinator(DataUpdateCoordinator):
         super().__init__(
             hass,
             _LOGGER,
+            config_entry=config_entry,
             name=DOMAIN,
             update_interval=timedelta(minutes=refresh_interval),
         )
@@ -253,6 +253,11 @@ class CloudEdgeCoordinator(DataUpdateCoordinator):
                 self.hass.async_add_executor_job(self._fetch_data),
                 timeout=60.0  # 60 second timeout
             )
+            # MQTT and streaming callbacks may have arrived during blocking I/O.
+            # Merge their latest state on the event loop just before publishing.
+            for serial_number, device_info in result.items():
+                self._merge_runtime_device_state(serial_number, device_info)
+            self._last_update_time = datetime.now(timezone.utc)
             _LOGGER.debug("Data update cycle completed successfully")
             return result
         except asyncio.CancelledError:
@@ -424,6 +429,7 @@ class CloudEdgeCoordinator(DataUpdateCoordinator):
         if self.client is None:
             return False
 
+        self._authenticated = False
         if force_refresh:
             success = refresh_invalid_session(
                 self.client,
@@ -431,6 +437,7 @@ class CloudEdgeCoordinator(DataUpdateCoordinator):
                 start_transport=self._start_mqtt,
             )
         else:
+            self._stop_mqtt()
             success = bool(self.client.authenticate())
             if success:
                 self._start_mqtt()
@@ -467,19 +474,33 @@ class CloudEdgeCoordinator(DataUpdateCoordinator):
         if self.hass.loop.is_closed():
             return
         self.hass.loop.call_soon_threadsafe(
-            self.async_set_updated_data,
-            dict(self.data),
+            self._async_publish_runtime_update,
         )
 
+    @callback
+    def _async_publish_runtime_update(self) -> None:
+        """Publish current data, never a snapshot captured in a worker thread."""
+        self.async_set_updated_data(dict(self.data or {}))
+
     def set_runtime_connection_status(self, serial_number: str, status: str) -> None:
+        """Schedule stream status updates on the Home Assistant event loop."""
+        if not self.hass.loop.is_closed():
+            self.hass.loop.call_soon_threadsafe(
+                self._async_set_runtime_connection_status, serial_number, status
+            )
+
+    @callback
+    def _async_set_runtime_connection_status(self, serial_number: str, status: str) -> None:
         """Update the in-memory connection status for a single device."""
         device_data = (self.data or {}).get(serial_number)
         if not device_data:
             return
         if device_data.get("connection_status") == status:
             return
-        device_data["connection_status"] = status
-        self._publish_runtime_update()
+        self.async_set_updated_data({
+            **self.data,
+            serial_number: {**device_data, "connection_status": status},
+        })
 
     def _get_device_connection_status(self, serial_number: str) -> str:
         """Return the connection status of a device.
@@ -646,10 +667,12 @@ class CloudEdgeCoordinator(DataUpdateCoordinator):
                     _LOGGER.debug("Fetching detailed info for device: %s (SN: %s)", 
                                 device.get("name"), device.get("serial_number"))
                     
-                    # Get basic device info without config
-                    device_info = self.client.get_device_info(
-                        device["name"], include_config=False
-                    )
+                    # Names are not unique. Reuse the discovered identity instead
+                    # of rediscovering the entire inventory by name for each device.
+                    device_info = dict(device)
+                    status = self.client.get_device_status(device["device_id"])
+                    if status:
+                        device_info.update(status)
                     
                     if device_info:
                         serial_number = device["serial_number"]
@@ -772,7 +795,9 @@ class CloudEdgeCoordinator(DataUpdateCoordinator):
         """Return the refresh interval in minutes."""
         return int(self.update_interval.total_seconds() / 60) if self.update_interval else 0
 
-    async def async_refresh_device_config(self, device_name: str) -> bool:
+    async def async_refresh_device_config(
+        self, device_name: str, *, serial_number: str | None = None
+    ) -> bool:
         """
         Refresh configuration for a specific device without affecting other devices.
         
@@ -790,7 +815,8 @@ class CloudEdgeCoordinator(DataUpdateCoordinator):
             device_sn = None
             
             for sn, device_data in self.data.items():
-                if device_data.get('name') == device_name:
+                if (sn == serial_number if serial_number is not None
+                        else device_data.get('name') == device_name):
                     device = device_data
                     device_sn = sn
                     break
@@ -875,7 +901,7 @@ class CloudEdgeCoordinator(DataUpdateCoordinator):
         return {
             "refresh_interval_minutes": self.refresh_interval_minutes,
             "last_update_success": self.last_update_success,
-            "last_update_time": self.last_update_success_time,
+            "last_update_time": self._last_update_time,
             "authenticated": self._authenticated,
             "device_count": len(self.data) if self.data else 0,
             "active_streams": sum(
@@ -899,6 +925,28 @@ class CloudEdgeCoordinator(DataUpdateCoordinator):
             except Exception as err:
                 _LOGGER.debug("Failed to refresh stream device %s: %s", serial_number, err)
         return None
+
+    async def async_set_device_parameter(
+        self, serial_number: str, parameter_code: str, value: int
+    ) -> None:
+        """Control the entity's exact device, including accounts with duplicate names."""
+        device = (self.data or {}).get(serial_number)
+        if self.client is None or device is None:
+            raise HomeAssistantError(f"Device {serial_number} is not available")
+        try:
+            success = await self.hass.async_add_executor_job(partial(
+                self.client.set_device_config,
+                serial_number,
+                {parameter_code: value},
+                device_id=device.get("device_id"),
+            ))
+        except Exception as err:
+            raise HomeAssistantError(f"Failed to set parameter {parameter_code}: {err}") from err
+        if not success:
+            raise HomeAssistantError(f"Failed to set parameter {parameter_code}: API returned false")
+        await self.async_refresh_device_config(
+            device.get("name", serial_number), serial_number=serial_number
+        )
 
     async def async_get_stream_source(self, serial_number: str) -> str | None:
         """Return a local stream source URL for the requested device."""
@@ -955,8 +1003,7 @@ class CloudEdgeCoordinator(DataUpdateCoordinator):
             _LOGGER.warning("Initial refresh timed out - will retry on next cycle")
             return False
         except asyncio.CancelledError:
-            _LOGGER.warning("First refresh cancelled - will retry on next cycle")
-            return False
+            raise
         except Exception as e:
             _LOGGER.error("First refresh failed: %s - will retry on next cycle", e)
             return False

@@ -7,7 +7,6 @@ from typing import Any
 from homeassistant.components.switch import SwitchEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
@@ -21,7 +20,6 @@ from .const import (
 from cloudedge.iot_parameters import (
     IOT_PARAMETERS,
     BOOLEAN_PARAMETERS,
-    get_parameter_name,
     format_parameter_value,
 )
 
@@ -212,77 +210,10 @@ class CloudEdgeConfigSwitch(CloudEdgeBaseSwitch):
         await self._set_parameter("0")
 
     async def _set_parameter(self, value: str) -> None:
-        """Set the parameter value."""
-        try:
-            # Use the coordinator's client to set the parameter
-            client = self.coordinator.client
-            if client:
-                # Find device name for parameter setting (API requires device name, not serial)
-                device_data = self.coordinator.data.get(self._serial_number)
-                if device_data and device_data.get('name'):
-                    device_name = device_data['name']
-                    
-                    # Convert parameter code to parameter name (API expects names, not codes)
-                    from cloudedge.iot_parameters import get_parameter_name
-                    param_name = get_parameter_name(self._param_key)
-                    
-                    # Use the client's set_device_parameter method
-                    success = await self.hass.async_add_executor_job(
-                        client.set_device_parameter,
-                        device_name,
-                        param_name,  # Use parameter name, not code
-                        int(value)  # Convert to int for API
-                    )
-                    
-                    if success:
-                        _LOGGER.debug(
-                            "Successfully set parameter %s (%s) to %s for device %s",
-                            param_name,
-                            self._param_key,
-                            value,
-                            device_name,
-                        )
-                        
-                        # Trigger parameter refresh to get updated values for all parameters
-                        try:
-                            await self.hass.services.async_call(
-                                "cloudedge",
-                                "refresh_parameters",
-                                {"device_name": device_name},
-                                blocking=False,  # Don't block the switch operation
-                            )
-                            _LOGGER.debug("Triggered parameter refresh for device %s (serial: %s) after setting %s", 
-                                        device_name, self._serial_number, param_name)
-                        except Exception as refresh_err:
-                            _LOGGER.warning(
-                                "Failed to trigger parameter refresh for device %s: %s",
-                                device_name,
-                                refresh_err
-                            )
-                            # Fallback to device-specific refresh if available, otherwise full refresh
-                            if hasattr(self.coordinator, 'async_refresh_device_config'):
-                                _LOGGER.debug("Using device-specific refresh fallback for %s", device_name)
-                                await self.coordinator.async_refresh_device_config(device_name)
-                            else:
-                                await self.coordinator.async_request_refresh()
-                    else:
-                        raise HomeAssistantError(
-                            f"Failed to set {param_name} to {value} for device "
-                            f"{device_name}: API returned false"
-                        )
-                else:
-                    raise HomeAssistantError(
-                        f"Device name not found for serial {self._serial_number}"
-                    )
-            else:
-                raise HomeAssistantError("CloudEdge client not available")
-        except HomeAssistantError:
-            raise
-        except Exception as err:
-            raise HomeAssistantError(
-                f"Failed to set parameter {self._param_key} to {value} "
-                f"for device {self._serial_number}: {err}"
-            ) from err
+        """Set a parameter on this entity's device by its stable serial number."""
+        await self.coordinator.async_set_device_parameter(
+            self._serial_number, self._param_key, int(value)
+        )
 
     @property
     def icon(self) -> str:
@@ -387,76 +318,10 @@ class CloudEdgeGenericSwitch(CloudEdgeBaseSwitch):
         await self._set_parameter("0")
 
     async def _set_parameter(self, value: str) -> None:
-        """Set the parameter value."""
-        try:
-            # Use the coordinator's client to set the parameter
-            client = self.coordinator.client
-            if client:
-                # Find device name for parameter setting (API requires device name, not serial)
-                device_data = self.coordinator.data.get(self._serial_number)
-                if device_data and device_data.get('name'):
-                    device_name = device_data['name']
-                    
-                    # Convert parameter code to parameter name (API expects names, not codes)
-                    param_name = self._iot_param_name  # Use the IoT parameter name
-                    
-                    # Use the client's set_device_parameter method
-                    success = await self.hass.async_add_executor_job(
-                        client.set_device_parameter,
-                        device_name,
-                        param_name,  # Use parameter name, not code
-                        int(value)  # Convert to int for API
-                    )
-                    
-                    if success:
-                        _LOGGER.debug(
-                            "Successfully set parameter %s (%s) to %s for device %s",
-                            param_name,
-                            self._param_key,
-                            value,
-                            device_name,
-                        )
-                        
-                        # Trigger parameter refresh to get updated values for all parameters
-                        try:
-                            await self.hass.services.async_call(
-                                "cloudedge",
-                                "refresh_parameters",
-                                {"device_name": device_name},
-                                blocking=False,  # Don't block the switch operation
-                            )
-                            _LOGGER.debug("Triggered parameter refresh for device %s (serial: %s) after setting %s", 
-                                        device_name, self._serial_number, param_name)
-                        except Exception as refresh_err:
-                            _LOGGER.warning(
-                                "Failed to trigger parameter refresh for device %s: %s",
-                                device_name,
-                                refresh_err
-                            )
-                            # Fallback to device-specific refresh if available, otherwise full refresh
-                            if hasattr(self.coordinator, 'async_refresh_device_config'):
-                                _LOGGER.debug("Using device-specific refresh fallback for %s", device_name)
-                                await self.coordinator.async_refresh_device_config(device_name)
-                            else:
-                                await self.coordinator.async_request_refresh()
-                    else:
-                        raise HomeAssistantError(
-                            f"Failed to set {param_name} to {value} for device "
-                            f"{device_name}: API returned false"
-                        )
-                else:
-                    raise HomeAssistantError(
-                        f"Device name not found for serial {self._serial_number}"
-                    )
-            else:
-                raise HomeAssistantError("CloudEdge client not available")
-        except HomeAssistantError:
-            raise
-        except Exception as err:
-            raise HomeAssistantError(
-                f"Failed to set parameter {self._param_key} to {value} "
-                f"for device {self._serial_number}: {err}"
-            ) from err
+        """Set a parameter on this entity's device by its stable serial number."""
+        await self.coordinator.async_set_device_parameter(
+            self._serial_number, self._param_key, int(value)
+        )
 
     @property
     def icon(self) -> str:
