@@ -670,9 +670,14 @@ class CloudEdgeCoordinator(DataUpdateCoordinator):
                     # Names are not unique. Reuse the discovered identity instead
                     # of rediscovering the entire inventory by name for each device.
                     device_info = dict(device)
-                    status = self.client.get_device_status(device["device_id"])
-                    if status:
-                        device_info.update(status)
+                    # A status endpoint failure must not skip the separate
+                    # configuration request and remove battery/switch data.
+                    try:
+                        status = self.client.get_device_status(device["device_id"])
+                        if status:
+                            device_info.update(status)
+                    except Exception as status_error:
+                        _LOGGER.debug("Could not get device status: %s", status_error)
                     
                     if device_info:
                         serial_number = device["serial_number"]
@@ -715,7 +720,13 @@ class CloudEdgeCoordinator(DataUpdateCoordinator):
                                 device_info['configuration'] = {}
                                 _LOGGER.debug("Device %s config response was empty", device["name"])
                         except Exception as config_error:
-                            _LOGGER.debug("Could not get config for device %s: %s", device["name"], config_error)
+                            if isinstance(config_error, AuthenticationError):
+                                _LOGGER.warning(
+                                    "CloudEdge rejected IoT authorization for %s; "
+                                    "configuration entities cannot be refreshed", device["name"]
+                                )
+                            else:
+                                _LOGGER.debug("Could not get config for device %s: %s", device["name"], type(config_error).__name__)
                             device_info['configuration'] = {}
                         
                         # Fetch dormancy-aware connection status
@@ -766,6 +777,10 @@ class CloudEdgeCoordinator(DataUpdateCoordinator):
                     device_data[serial_number] = fallback_device
 
             for serial_number, device_info in device_data.items():
+                if not device_info.get("configuration"):
+                    previous_config = (self.data or {}).get(serial_number, {}).get("configuration")
+                    if previous_config:
+                        device_info["configuration"] = dict(previous_config)
                 self._merge_runtime_device_state(serial_number, device_info)
 
             self._stream_manager.remove_missing(set(device_data))
@@ -864,9 +879,6 @@ class CloudEdgeCoordinator(DataUpdateCoordinator):
                             'formatted': formatted_value
                         }
                     
-                    # Check if this device previously had no configuration
-                    had_no_config = not self.data[device_sn].get('configuration')
-                    
                     # Update only this device's configuration
                     self.data[device_sn]['configuration'] = processed_config
                     
@@ -875,14 +887,6 @@ class CloudEdgeCoordinator(DataUpdateCoordinator):
                     
                     # Notify existing entities about the update
                     self.async_update_listeners()
-                    
-                    # If device previously had no configuration, user needs to reload manually
-                    if had_no_config and processed_config:
-                        _LOGGER.warning(
-                            "Device %s now has %d parameters (previously had none). "
-                            "Please RELOAD the integration from the UI to see all sensor entities.",
-                            device_name, len(processed_config)
-                        )
                     
                     return True
                 else:

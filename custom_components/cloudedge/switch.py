@@ -7,6 +7,7 @@ from typing import Any
 from homeassistant.components.switch import SwitchEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
@@ -34,86 +35,61 @@ async def async_setup_entry(
     """Set up CloudEdge switch platform."""
     coordinator: CloudEdgeCoordinator = hass.data[DOMAIN][config_entry.entry_id]
 
-    # Handle case where coordinator.data might be None
-    if not coordinator.data:
-        _LOGGER.warning("No device data available yet, switch entities will be added when data is available")
-        
-        # Add a listener to create entities when data becomes available.
-        # Must be a sync @callback: async_add_listener invokes listeners
-        # synchronously, so an async def would never be awaited.
-        @callback
-        def _handle_coordinator_update() -> None:
-            if coordinator.data and not getattr(coordinator, '_switches_added', False):
-                _LOGGER.info("Device data is now available, adding switch entities")
-                switches = []
-                for serial_number, device_info in coordinator.data.items():
-                    # Add configuration-based switches
-                    if config := device_info.get("configuration"):
-                        # Add known switch parameters first
-                        for param_name, param_key in SWITCH_PARAMETERS.items():
-                            if param_key in config:
-                                switch = CloudEdgeConfigSwitch(
-                                    coordinator, serial_number, device_info, param_name, param_key
-                                )
-                                switches.append(switch)
-                        
-                        # Add ALL boolean IoT parameters as switches (disabled by default)
-                        for param_code, param_info in config.items():
-                            if param_code not in SWITCH_PARAMETERS.values():
-                                # Get the parameter name from IoT parameters
-                                iot_param_info = IOT_PARAMETERS.get(param_code)
-                                if iot_param_info and iot_param_info["name"] in BOOLEAN_PARAMETERS:
-                                    param_name = iot_param_info["name"].lower()
-                                    
-                                    switch = CloudEdgeGenericSwitch(
-                                        coordinator, serial_number, device_info, param_name, param_code, param_info
-                                    )
-                                    switches.append(switch)
-                
-                if switches:
-                    async_add_entities(switches)
-                    coordinator._switches_added = True
-        
-        coordinator.async_add_listener(_handle_coordinator_update)
-        async_add_entities([])
-        return
+    registry = er.async_get(hass)
+    added: set[str] = set()
 
-    switches = []
-    for serial_number, device_info in coordinator.data.items():
-        # Add configuration-based switches
-        if config := device_info.get("configuration"):
-            device_name = device_info.get("name", serial_number)
-            _LOGGER.debug("Device %s - Setting up switches", device_name)
-            
-            # Add known switch parameters first
+    @callback
+    def _async_add_missing() -> None:
+        switches = []
+        for serial_number, device_info in (coordinator.data or {}).items():
+            config = dict(device_info.get("configuration") or {})
+            for code, info in IOT_PARAMETERS.items():
+                if info["name"] not in BOOLEAN_PARAMETERS:
+                    continue
+                legacy_id = f"{DOMAIN}_{serial_number}_{info['name'].lower()}_switch"
+                curated = next((name for name, key in SWITCH_PARAMETERS.items() if key == code), None)
+                if (registry.async_get_entity_id("switch", DOMAIN, legacy_id)
+                        or (curated and registry.async_get_entity_id(
+                            "switch", DOMAIN, f"{DOMAIN}_{serial_number}_{curated}"))):
+                    config.setdefault(code, {})
             for param_name, param_key in SWITCH_PARAMETERS.items():
-                if param_key in config:
-                    iot_info = IOT_PARAMETERS.get(param_key)
-                    enabled = bool(iot_info and iot_info["name"] in ENABLED_BY_DEFAULT_SWITCH_PARAMS)
-                    _LOGGER.debug("Creating CloudEdgeConfigSwitch %s (%s) - enabled by default: %s",
-                                param_name, param_key, enabled)
-                    switch = CloudEdgeConfigSwitch(
-                        coordinator, serial_number, device_info, param_name, param_key
-                    )
-                    switches.append(switch)
-            
-            # Add ALL boolean IoT parameters as switches (disabled by default)
-            for param_code, param_info in config.items():
-                if param_code not in SWITCH_PARAMETERS.values():
-                    # Get the parameter name from IoT parameters
-                    iot_param_info = IOT_PARAMETERS.get(param_code)
-                    if iot_param_info and iot_param_info["name"] in BOOLEAN_PARAMETERS:
-                        param_name = iot_param_info["name"].lower()
-                        enabled = iot_param_info["name"] in ENABLED_BY_DEFAULT_SWITCH_PARAMS
-                        if enabled:
-                            _LOGGER.debug("Creating enabled-by-default switch: %s (code %s)", param_name, param_code)
-                        
-                        switch = CloudEdgeGenericSwitch(
-                            coordinator, serial_number, device_info, param_name, param_code, param_info
-                        )
-                        switches.append(switch)
+                if param_key not in config:
+                    continue
+                iot_info = IOT_PARAMETERS[param_key]
+                legacy_id = f"{DOMAIN}_{serial_number}_{iot_info['name'].lower()}_switch"
+                curated_id = f"{DOMAIN}_{serial_number}_{param_name}"
+                legacy_exists = registry.async_get_entity_id("switch", DOMAIN, legacy_id)
+                curated_exists = registry.async_get_entity_id("switch", DOMAIN, curated_id)
+                # Before 1.4 these were generic switches. Keep their registered
+                # identity (and user settings); do not force dashboard renames.
+                # If both identities already exist, continue serving both.
+                if legacy_exists:
+                    switches.append(CloudEdgeGenericSwitch(
+                        coordinator, serial_number, device_info,
+                        iot_info["name"].lower(), param_key, config[param_key],
+                    ))
+                if not legacy_exists or curated_exists:
+                    switches.append(CloudEdgeConfigSwitch(
+                        coordinator, serial_number, device_info, param_name, param_key,
+                    ))
 
-    async_add_entities(switches)
+            for param_code, param_info in config.items():
+                if param_code in SWITCH_PARAMETERS.values():
+                    continue
+                iot_info = IOT_PARAMETERS.get(param_code)
+                if iot_info and iot_info["name"] in BOOLEAN_PARAMETERS:
+                    switches.append(CloudEdgeGenericSwitch(
+                        coordinator, serial_number, device_info,
+                        iot_info["name"].lower(), param_code, param_info,
+                    ))
+
+        new_entities = [entity for entity in switches if entity.unique_id not in added]
+        if new_entities:
+            added.update(entity.unique_id for entity in new_entities)
+            async_add_entities(new_entities)
+
+    config_entry.async_on_unload(coordinator.async_add_listener(_async_add_missing))
+    _async_add_missing()
 
 
 class CloudEdgeBaseSwitch(CoordinatorEntity[CloudEdgeCoordinator], SwitchEntity):
@@ -147,8 +123,10 @@ class CloudEdgeBaseSwitch(CoordinatorEntity[CloudEdgeCoordinator], SwitchEntity)
     @property
     def available(self) -> bool:
         """Return if switch is available."""
-        # Always available if coordinator has data, don't check device online status
-        return self.coordinator.last_update_success and bool(self.coordinator.data)
+        if not self.coordinator.last_update_success or not self.coordinator.data:
+            return False
+        device = self.coordinator.data.get(self._serial_number, {})
+        return bool(device.get("configuration", {}).get(self._param_key))
 
 
 class CloudEdgeConfigSwitch(CloudEdgeBaseSwitch):
