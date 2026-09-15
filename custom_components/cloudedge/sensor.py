@@ -17,6 +17,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import PERCENTAGE, UnitOfTemperature
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity import EntityCategory
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
@@ -45,22 +46,32 @@ async def async_setup_entry(
 ) -> None:
     """Set up CloudEdge sensor platform."""
     coordinator: CloudEdgeCoordinator = hass.data[DOMAIN][config_entry.entry_id]
+    registry = er.async_get(hass)
+    curated_names = {code: name for name, code in SENSOR_PARAMETERS.items()}
 
     def _build_sensors() -> list[SensorEntity]:
         sensors = []
-        for serial_number, device_info in coordinator.data.items():
+        for serial_number, device_info in (coordinator.data or {}).items():
             # Connection status sensor is added for every device
             sensors.append(CloudEdgeConnectionStatusSensor(
                 coordinator, serial_number, device_info
             ))
 
-            if config := device_info.get("configuration"):
+            config = dict(device_info.get("configuration") or {})
+            # Restore known identities even if the cloud is unavailable at
+            # startup. Their availability still depends on actual data.
+            for code, info in IOT_PARAMETERS.items():
+                name = curated_names.get(code, info["name"].lower())
+                unique_id = f"{DOMAIN}_{serial_number}_{name}"
+                if registry.async_get_entity_id("sensor", DOMAIN, unique_id):
+                    config.setdefault(code, {})
+            if config:
                 device_name = device_info.get("name", serial_number)
-                _LOGGER.info("Device %s has %d parameters", device_name, len(config))
+                _LOGGER.debug("Device %s has %d parameters", device_name, len(config))
 
                 # Log which enabled-by-default parameters are present
                 enabled_params_present = [code for code in ENABLED_BY_DEFAULT_SENSOR_PARAMS if code in config]
-                _LOGGER.info("Device %s - Enabled-by-default params present: %s",
+                _LOGGER.debug("Device %s - Enabled-by-default params present: %s",
                             device_name, enabled_params_present if enabled_params_present else "None")
 
                 for param_name, param_key in SENSOR_PARAMETERS.items():
@@ -91,23 +102,20 @@ async def async_setup_entry(
                 ))
         return sensors
 
-    if not coordinator.data:
-        _LOGGER.warning("No device data available yet, sensor entities will be added when data is available")
+    added: set[str] = set()
 
-        @callback
-        def _async_add_when_ready() -> None:
-            if coordinator.data and not getattr(coordinator, "_sensors_added", False):
-                coordinator._sensors_added = True
-                sensors = _build_sensors()
-                _LOGGER.info("Adding %d sensor entities (deferred)", len(sensors))
-                async_add_entities(sensors)
+    @callback
+    def _async_add_missing() -> None:
+        # A sleeping camera may expose its parameters only on a later refresh.
+        # Keep existing entity IDs and add each newly discovered sensor once.
+        sensors = [entity for entity in _build_sensors() if entity.unique_id not in added]
+        if sensors:
+            added.update(entity.unique_id for entity in sensors)
+            _LOGGER.info("Adding %d newly discovered sensor entities", len(sensors))
+            async_add_entities(sensors)
 
-        coordinator.async_add_listener(_async_add_when_ready)
-        return
-
-    sensors = _build_sensors()
-    _LOGGER.info("Adding %d sensor entities", len(sensors))
-    async_add_entities(sensors)
+    config_entry.async_on_unload(coordinator.async_add_listener(_async_add_missing))
+    _async_add_missing()
 
 
 class CloudEdgeBaseSensor(CoordinatorEntity[CloudEdgeCoordinator], SensorEntity):
@@ -144,7 +152,10 @@ class CloudEdgeBaseSensor(CoordinatorEntity[CloudEdgeCoordinator], SensorEntity)
         if not self.coordinator.last_update_success:
             return False
         device_data = self.coordinator.data.get(self._serial_number)
-        return device_data is not None
+        if device_data is None:
+            return False
+        param_key = getattr(self, "_param_key", None)
+        return param_key is None or bool(device_data.get("configuration", {}).get(param_key))
 
 
 class CloudEdgeConfigSensor(CloudEdgeBaseSensor):
@@ -283,7 +294,7 @@ class CloudEdgeGenericSensor(CloudEdgeBaseSensor):
     @property
     def available(self) -> bool:
         """Return if sensor is available."""
-        return self.coordinator.last_update_success and bool(self.coordinator.data)
+        return super().available
 
     @property
     def native_value(self) -> int | float | str | datetime | None:
