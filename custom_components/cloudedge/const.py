@@ -202,7 +202,6 @@ COUNTRY_CODES = {
     "UA": "+380",
     "AE": "+971",
     "GB": "+44",
-    "UK": "+44",
     "US": "+1",
     "UY": "+598",
     "UZ": "+998",
@@ -214,15 +213,6 @@ COUNTRY_CODES = {
     "ZM": "+260",
     "ZW": "+263",
 }
-
-# Device types mapping
-DEVICE_TYPE_CAMERA = "Camera"
-DEVICE_TYPE_DOORBELL = "Doorbell"
-DEVICE_TYPE_SENSOR = "Sensor"
-
-# Entity categories
-ENTITY_CATEGORY_CONFIG = "config"
-ENTITY_CATEGORY_DIAGNOSTIC = "diagnostic"
 
 # Curated switch parameters (mapped to parameter codes, not names — the
 # coordinator keys device configuration by numeric IoT parameter code).
@@ -253,13 +243,3 @@ ENABLED_BY_DEFAULT_SWITCH_PARAMS = [
     "MOTION_DET_ENABLE",  # Motion detection enable (config)
     "LED_ENABLE",         # LED enable (config)
 ]
-
-# Sensor device classes
-SENSOR_DEVICE_CLASS_BATTERY = "battery"
-SENSOR_DEVICE_CLASS_SIGNAL_STRENGTH = "signal_strength"
-SENSOR_DEVICE_CLASS_TEMPERATURE = "temperature"
-
-# Sensor units
-SENSOR_UNIT_PERCENTAGE = "%"
-SENSOR_UNIT_CELSIUS = "°C"
-SENSOR_UNIT_DECIBEL = "dB"

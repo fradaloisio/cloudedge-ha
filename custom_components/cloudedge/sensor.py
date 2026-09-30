@@ -27,6 +27,7 @@ from .const import (
     SENSOR_PARAMETERS,
     ENABLED_BY_DEFAULT_SENSOR_PARAMS,
 )
+from .entity import CloudEdgeEntityMixin
 from cloudedge.iot_parameters import (
     IOT_PARAMETERS,
     BOOLEAN_PARAMETERS,
@@ -118,7 +119,9 @@ async def async_setup_entry(
     _async_add_missing()
 
 
-class CloudEdgeBaseSensor(CoordinatorEntity[CloudEdgeCoordinator], SensorEntity):
+class CloudEdgeBaseSensor(
+    CloudEdgeEntityMixin, CoordinatorEntity[CloudEdgeCoordinator], SensorEntity
+):
     """Base class for CloudEdge sensors."""
 
     _attr_has_entity_name = True
@@ -133,18 +136,6 @@ class CloudEdgeBaseSensor(CoordinatorEntity[CloudEdgeCoordinator], SensorEntity)
         super().__init__(coordinator)
         self._serial_number = serial_number
         self._device_info = device_info
-
-    @property
-    def device_info(self) -> dict[str, Any]:
-        """Return device information."""
-        return {
-            "identifiers": {(DOMAIN, self._serial_number)},
-            "name": self._device_info.get("name", f"Camera {self._serial_number}"),
-            "manufacturer": "CloudEdge",
-            "model": self._device_info.get("type", "SmartEye Camera"),
-            "serial_number": self._serial_number,
-            "sw_version": self._device_info.get("firmware_version"),
-        }
 
     @property
     def available(self) -> bool:
@@ -292,11 +283,6 @@ class CloudEdgeGenericSensor(CloudEdgeBaseSensor):
             self._attr_device_class = SensorDeviceClass.TIMESTAMP
 
     @property
-    def available(self) -> bool:
-        """Return if sensor is available."""
-        return super().available
-
-    @property
     def native_value(self) -> int | float | str | datetime | None:
         """Return the value of the sensor."""
         device_data = self.coordinator.data.get(self._serial_number)
@@ -307,7 +293,7 @@ class CloudEdgeGenericSensor(CloudEdgeBaseSensor):
         if not param_info:
             return None
         value = param_info.get("value")
-        
+
         if self._iot_param_name in TIMESTAMP_PARAMETERS:
             try:
                 return datetime.fromtimestamp(int(value), tz=timezone.utc)

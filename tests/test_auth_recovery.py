@@ -37,7 +37,7 @@ def test_invalid_session_forces_login_and_rotates_transport():
     )
 
     assert result is True
-    assert client.calls == [(True, None)]
+    assert client.calls == [(True, {"userToken": "rejected-token"})]
     assert client.session_data == {"userToken": "fresh-token"}
     assert events == ["stop", "start"]
 
@@ -53,5 +53,6 @@ def test_failed_refresh_leaves_transport_stopped():
     )
 
     assert result is False
-    assert client.calls == [(True, None)]
+    assert client.calls == [(True, {"userToken": "rejected-token"})]
+    assert client.session_data == {"userToken": "rejected-token"}
     assert events == ["stop"]

@@ -18,7 +18,6 @@ def refresh_invalid_session(
     forced refresh succeeds.
     """
     stop_transport()
-    client.session_data = None
 
     if not client.authenticate(force_refresh=True):
         return False

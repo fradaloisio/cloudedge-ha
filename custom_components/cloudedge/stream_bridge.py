@@ -499,26 +499,42 @@ class CloudEdgeStreamBridge:
             self._mpegts_bootstrap.clear()
             self._bootstrap_reset.clear()
 
-        # Hold _ffmpeg_lock: _start_ffmpeg_muxer runs from the pycloudedge
-        # video-callback thread and could otherwise spawn a fresh ffmpeg
-        # right after this teardown, leaving an orphaned process.
+        # Teardown order matters: terminate the process BEFORE touching its
+        # pipes. Closing stdin first would flush a BufferedWriter into a
+        # full pipe that a wedged ffmpeg no longer drains — close() then
+        # blocks forever while holding this lock. After terminate/kill the
+        # read end closes, blocked writers get EPIPE and exit on their own.
+        # _ffmpeg_lock is held across the whole teardown so the video
+        # callback thread cannot spawn a fresh muxer in between (it checks
+        # _running, already False, under the same lock).
         with self._ffmpeg_lock:
-            if self._ffmpeg_proc is not None:
+            proc = self._ffmpeg_proc
+            self._ffmpeg_proc = None
+            if proc is not None:
                 try:
-                    if self._ffmpeg_proc.stdin:
-                        self._ffmpeg_proc.stdin.close()
-                except OSError:
+                    proc.terminate()
+                except Exception:
                     pass
                 try:
-                    self._ffmpeg_proc.terminate()
-                    self._ffmpeg_proc.wait(timeout=5)
+                    proc.wait(timeout=5)
                 except Exception:
                     try:
-                        self._ffmpeg_proc.kill()
-                        self._ffmpeg_proc.wait(timeout=2)
+                        proc.kill()
                     except Exception:
                         pass
-                self._ffmpeg_proc = None
+                    try:
+                        proc.wait(timeout=2)
+                    except Exception:
+                        pass
+                # Process is gone: closing the pipes can no longer block on
+                # a full buffer, and the pacer/audio writer either exited
+                # on EPIPE or will on the next write.
+                for stream in (proc.stdin, proc.stdout, proc.stderr):
+                    try:
+                        if stream is not None:
+                            stream.close()
+                    except Exception:
+                        pass
 
         while not self._video_queue.empty():
             try:
@@ -585,8 +601,14 @@ class CloudEdgeStreamBridge:
                 client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 client.settimeout(5)
                 with self._stream_clients_lock:
-                    if self._mpegts_bootstrap:
-                        client.sendall(self._mpegts_bootstrap)
+                    bootstrap = bytes(self._mpegts_bootstrap)
+                # Transmit outside the clients lock: a slow bootstrap
+                # handshake must not block diagnostics or broadcasts. The
+                # socket is not yet in the client list, so no other sender
+                # can interleave with this sendall.
+                if bootstrap:
+                    client.sendall(bootstrap)
+                with self._stream_clients_lock:
                     self._stream_clients.append(client)
             except OSError as err:
                 _LOGGER.debug(
@@ -666,15 +688,27 @@ class CloudEdgeStreamBridge:
         return True
 
     def _broadcast_stream(self, data: bytes) -> None:
+        # Snapshot under the lock, transmit outside it: a stalled client
+        # (full TCP buffer) blocks only its own sendall, never diagnostics
+        # (client_count) or anything else reading connection state.
         with self._stream_clients_lock:
-            dead: list[socket.socket] = []
-            for client in self._stream_clients:
-                try:
-                    client.sendall(data)
-                except (BrokenPipeError, ConnectionError, OSError):
-                    dead.append(client)
+            clients = list(self._stream_clients)
+        dead = []
+        for client in clients:
+            try:
+                client.sendall(data)
+            except (BrokenPipeError, ConnectionError, OSError):
+                dead.append(client)
+        if not dead:
+            if clients:
+                self._last_client_time = time.monotonic()
+            return
+        with self._stream_clients_lock:
             for client in dead:
-                self._stream_clients.remove(client)
+                # Guard against a concurrent prune/stop that already
+                # removed (and closed) this socket.
+                if client in self._stream_clients:
+                    self._stream_clients.remove(client)
                 try:
                     client.close()
                 except OSError:
@@ -721,13 +755,16 @@ class CloudEdgeStreamBridge:
         ]
         if audio_fifo:
             # Second input: G.711 µ-law from the camera via a named FIFO fed
-            # at a fixed cadence (silence-filled), wallclock-stamped so A/V
-            # stay aligned across live-window gaps.
+            # at a fixed cadence (silence-filled). No wallclock timestamps
+            # here: the µ-law demuxer must emit clean 0-based PTS, otherwise
+            # the muxed AAC carries absolute-clock PTS and PyAV cannot infer
+            # the stream profile — Home Assistant's stream worker then drops
+            # the audio track ("profile is None"). The muxer only starts at
+            # the first video keyframe, so both inputs begin together and A/V
+            # stay aligned without a shared clock.
             cmd += [
                 "-thread_queue_size",
                 "512",
-                "-use_wallclock_as_timestamps",
-                "1",
                 "-f",
                 "mulaw",
                 "-ar",

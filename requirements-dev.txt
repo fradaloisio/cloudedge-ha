@@ -1,0 +1,11 @@
+# Test environment for `pytest tests/` (see .github/workflows/ci.yml).
+# Mirrors manifest.json requirements, plus Home Assistant itself and the
+# runtime deps of the HA components the tests touch (stream/camera need
+# numpy and PyTurboJPEG).
+homeassistant==2026.9.4
+pycloudedge==0.1.10
+paho-mqtt>=2.0.0
+pycryptodome>=3.15.0
+pytest
+numpy
+PyTurboJPEG

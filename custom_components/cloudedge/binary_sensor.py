@@ -21,6 +21,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from . import CloudEdgeCoordinator
 from .const import DOMAIN
+from .entity import CloudEdgeEntityMixin
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -39,31 +40,30 @@ async def async_setup_entry(
     if not coordinator.data:
         _LOGGER.warning("No device data available yet for binary sensors — will retry on first update")
 
-        @callback
-        def _async_add_when_ready() -> None:
-            if coordinator.data and not getattr(coordinator, "_binary_sensors_added", False):
-                coordinator._binary_sensors_added = True
-                entities: list[BinarySensorEntity] = []
-                for sn, info in coordinator.data.items():
-                    entities.append(CloudEdgeMotionSensor(coordinator, sn, info))
-                _LOGGER.info("Adding %d motion binary-sensor entities (deferred)", len(entities))
-                async_add_entities(entities)
+    added: set[str] = set()
 
-        coordinator.async_add_listener(_async_add_when_ready)
-        return
+    @callback
+    def _async_add_missing() -> None:
+        entities = [
+            entity for entity in (
+                CloudEdgeMotionSensor(coordinator, sn, info)
+                for sn, info in (coordinator.data or {}).items()
+            )
+            if entity.unique_id not in added
+        ]
+        if entities:
+            added.update(entity.unique_id for entity in entities)
+            _LOGGER.info("Adding %d motion binary-sensor entities", len(entities))
+            async_add_entities(entities)
 
-    entities: list[BinarySensorEntity] = []
-    for serial_number, device_info in coordinator.data.items():
-        entities.append(
-            CloudEdgeMotionSensor(coordinator, serial_number, device_info)
-        )
-
-    _LOGGER.info("Adding %d motion binary-sensor entities", len(entities))
-    async_add_entities(entities)
+    config_entry.async_on_unload(coordinator.async_add_listener(_async_add_missing))
+    _async_add_missing()
 
 
 class CloudEdgeMotionSensor(
-    CoordinatorEntity[CloudEdgeCoordinator], BinarySensorEntity
+    CloudEdgeEntityMixin,
+    CoordinatorEntity[CloudEdgeCoordinator],
+    BinarySensorEntity,
 ):
     """Binary sensor that reflects real-time MQTT motion events."""
 
@@ -83,17 +83,6 @@ class CloudEdgeMotionSensor(
         self._attr_unique_id = f"{DOMAIN}_{serial_number}_motion"
         self._attr_name = "Motion"
         self._clear_unsub: Any = None
-
-    @property
-    def device_info(self) -> dict[str, Any]:
-        return {
-            "identifiers": {(DOMAIN, self._serial_number)},
-            "name": self._device_info.get("name", f"Camera {self._serial_number}"),
-            "manufacturer": "CloudEdge",
-            "model": self._device_info.get("type", "SmartEye Camera"),
-            "serial_number": self._serial_number,
-            "sw_version": self._device_info.get("firmware_version"),
-        }
 
     @property
     def is_on(self) -> bool:

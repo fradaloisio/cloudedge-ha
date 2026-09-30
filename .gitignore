@@ -35,6 +35,7 @@ wheels/
 venv/
 env/
 ENV/
+.venv-ha
 
 # IDE
 .vscode/
@@ -53,9 +54,10 @@ htmlcov/
 # Logs
 *.log
 
-# Session cache
-cloudedge_session_cache
+# Session cache (per-entry variants embed the config entry id)
+cloudedge_session_cache*
 .cloudedge_session_cache
 .env
 
 test.py
+docs
