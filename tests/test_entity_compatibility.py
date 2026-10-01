@@ -5,15 +5,19 @@ import pytest
 
 pytest.importorskip("homeassistant")
 
-from homeassistant.helpers import entity_registry as er, device_registry as dr
-from custom_components.cloudedge import sensor, switch
+from homeassistant.helpers import entity_registry as er
+from custom_components.cloudedge import (
+    binary_sensor, button, camera, select, sensor, switch,
+)
 from custom_components.cloudedge.const import DOMAIN, SWITCH_PARAMETERS, SENSOR_PARAMETERS
 from cloudedge.iot_parameters import IOT_PARAMETERS, BOOLEAN_PARAMETERS
+from conftest import load_empty_registries
 from test_coordinator import make_coordinator
 
 
 def device(config):
-    return {"name": "Camera", "device_id": "id", "serial_number": "sn", "configuration": config}
+    # type_id 1 marks a camera device (camera/select platforms filter on it).
+    return {"name": "Camera", "device_id": "id", "serial_number": "sn", "type_id": 1, "configuration": config}
 
 
 @pytest.mark.parametrize("code,curated", [(code, name) for name, code in SWITCH_PARAMETERS.items()])
@@ -22,9 +26,7 @@ def test_upgrade_preserves_registered_legacy_switches(tmp_path, code, curated, h
     async def run():
         coordinator = make_coordinator(tmp_path)
         hass = coordinator.hass
-        dr.async_setup(hass)
-        await dr.async_load(hass, load_empty=True)
-        await er.async_load(hass, load_empty=True)
+        await load_empty_registries(hass)
         registry = er.async_get(hass)
         legacy_id = f"cloudedge_sn_{IOT_PARAMETERS[code]['name'].lower()}_switch"
         old = registry.async_get_or_create(
@@ -49,15 +51,26 @@ def test_upgrade_preserves_registered_legacy_switches(tmp_path, code, curated, h
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("platform", [sensor, switch])
+# All five platforms must discover devices incrementally: the listener
+# re-evaluates the inventory on every coordinator update and adds each new
+# unique_id exactly once (no one-shot flags that freeze later discoveries).
+_PLATFORM_EXPECTATIONS = [
+    (sensor, "cloudedge_sn_battery_level"),
+    (switch, "cloudedge_sn_motion_detection"),
+    (camera, "cloudedge_sn_camera"),
+    (select, "cloudedge_sn_stream_profile"),
+    (button, "sn_refresh_parameters"),
+    (binary_sensor, "cloudedge_sn_motion"),
+]
+
+
+@pytest.mark.parametrize("platform,unique_id", _PLATFORM_EXPECTATIONS)
 @pytest.mark.parametrize("empty_inventory", [False, True])
-def test_parameters_arriving_after_startup_add_entities_without_reload(tmp_path, platform, empty_inventory):
+def test_parameters_arriving_after_startup_add_entities_without_reload(tmp_path, platform, unique_id, empty_inventory):
     async def run():
         coordinator = make_coordinator(tmp_path)
         hass = coordinator.hass
-        dr.async_setup(hass)
-        await dr.async_load(hass, load_empty=True)
-        await er.async_load(hass, load_empty=True)
+        await load_empty_registries(hass)
         hass.data[DOMAIN] = {coordinator.config_entry.entry_id: coordinator}
         coordinator.data = None if empty_inventory else {"sn": device({})}
         entities = []
@@ -65,9 +78,10 @@ def test_parameters_arriving_after_startup_add_entities_without_reload(tmp_path,
         initial = {e.unique_id for e in entities}
         coordinator.data = {"sn": device({"154": {"value": 75}, "150": {"value": "1"}})}
         coordinator.async_update_listeners()
-        expected = "cloudedge_sn_battery_level" if platform is sensor else "cloudedge_sn_motion_detection"
-        assert expected not in initial
-        assert expected in {e.unique_id for e in entities}
+        assert unique_id in {e.unique_id for e in entities}
+        if platform in (sensor, switch):
+            # Parameter-gated platforms add nothing before the data arrives.
+            assert unique_id not in initial
         count = len(entities)
         coordinator.async_update_listeners()
         assert len(entities) == count
@@ -80,15 +94,37 @@ def test_parameters_arriving_after_startup_add_entities_without_reload(tmp_path,
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("platform,unique_id", _PLATFORM_EXPECTATIONS)
+def test_second_device_gets_entities_on_every_platform(tmp_path, platform, unique_id):
+    async def run():
+        coordinator = make_coordinator(tmp_path)
+        hass = coordinator.hass
+        await load_empty_registries(hass)
+        hass.data[DOMAIN] = {coordinator.config_entry.entry_id: coordinator}
+        coordinator.data = {"sn": device({"154": {"value": 75}, "150": {"value": "1"}})}
+        entities = []
+        await platform.async_setup_entry(hass, coordinator.config_entry, entities.extend)
+        coordinator.data = {
+            "sn": device({"154": {"value": 75}, "150": {"value": "1"}}),
+            "sn2": device({"154": {"value": 50}, "150": {"value": "0"}}),
+        }
+        coordinator.async_update_listeners()
+        ids = {e.unique_id for e in entities}
+        assert unique_id in ids
+        assert unique_id.replace("sn", "sn2") in ids
+        count = len(entities)
+        coordinator.async_update_listeners()
+        assert len(entities) == count
+    asyncio.run(run())
+
+
 def test_all_sensor_identities_match_the_legacy_schema(tmp_path):
     async def run():
         coordinator = make_coordinator(tmp_path)
         config = {code: {"value": 1} for code in IOT_PARAMETERS}
         coordinator.data = {"sn": device(config)}
         hass = coordinator.hass
-        dr.async_setup(hass)
-        await dr.async_load(hass, load_empty=True)
-        await er.async_load(hass, load_empty=True)
+        await load_empty_registries(hass)
         hass.data[DOMAIN] = {coordinator.config_entry.entry_id: coordinator}
         entities = []
         await sensor.async_setup_entry(hass, coordinator.config_entry, entities.extend)
@@ -109,9 +145,7 @@ def test_existing_generic_switch_inventory_is_not_lost(tmp_path):
     async def run():
         coordinator = make_coordinator(tmp_path)
         hass = coordinator.hass
-        dr.async_setup(hass)
-        await dr.async_load(hass, load_empty=True)
-        await er.async_load(hass, load_empty=True)
+        await load_empty_registries(hass)
         registry = er.async_get(hass)
         expected = set()
         for code, info in IOT_PARAMETERS.items():
@@ -163,9 +197,7 @@ def test_registered_entities_load_during_cloud_outage_and_recover(tmp_path, plat
     async def run():
         coordinator = make_coordinator(tmp_path)
         hass = coordinator.hass
-        dr.async_setup(hass)
-        await dr.async_load(hass, load_empty=True)
-        await er.async_load(hass, load_empty=True)
+        await load_empty_registries(hass)
         domain = 'sensor' if platform is sensor else 'switch'
         registry = er.async_get(hass)
         old = registry.async_get_or_create(domain, DOMAIN, unique_id)

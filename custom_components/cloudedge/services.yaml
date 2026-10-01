@@ -4,8 +4,18 @@ set_parameter:
   fields:
     device_name:
       name: Device Name
-      description: The name of the CloudEdge device.
-      required: true
+      description: >-
+        The name of the CloudEdge device. Ambiguous when several devices
+        share the same name; prefer device_id.
+      required: false
+      selector:
+        text:
+    device_id:
+      name: Device ID
+      description: >-
+        The device_id of the CloudEdge device. Takes precedence over
+        device_name and disambiguates devices with identical names.
+      required: false
       selector:
         text:
     parameter_name:
@@ -27,8 +37,18 @@ get_device_info:
   fields:
     device_name:
       name: Device Name
-      description: The name of the CloudEdge device.
-      required: true
+      description: >-
+        The name of the CloudEdge device. Ambiguous when several devices
+        share the same name; prefer device_id.
+      required: false
+      selector:
+        text:
+    device_id:
+      name: Device ID
+      description: >-
+        The device_id of the CloudEdge device. Takes precedence over
+        device_name and disambiguates devices with identical names.
+      required: false
       selector:
         text:
     include_config:
@@ -48,6 +68,12 @@ refresh_device:
       required: false
       selector:
         text:
+    device_id:
+      name: Device ID
+      description: The device_id of the device to refresh. Takes precedence over device_name.
+      required: false
+      selector:
+        text:
 
 refresh_parameters:
   name: Refresh Parameters
@@ -55,8 +81,19 @@ refresh_parameters:
   fields:
     device_name:
       name: Device Name
-      description: The name of the device to refresh parameters for.
-      required: true
+      description: >-
+        The name of the device to refresh parameters for. Ambiguous when
+        several devices share the same name; prefer device_id.
+      required: false
+      selector:
+        text:
+    device_id:
+      name: Device ID
+      description: >-
+        The device_id of the device to refresh parameters for. Takes
+        precedence over device_name and disambiguates devices with identical
+        names.
+      required: false
       selector:
         text:
 

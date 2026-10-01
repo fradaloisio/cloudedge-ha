@@ -19,14 +19,16 @@ SERVICE_SET_PARAMETER = "set_parameter"
 SERVICE_GET_DEVICE_INFO = "get_device_info"
 SERVICE_REFRESH_DEVICE = "refresh_device"
 SERVICE_REFRESH_PARAMETERS = "refresh_parameters"
-SERVICE_DEBUG_API_STATUS = "debug_api_status"
 SERVICE_GET_COORDINATOR_INFO = "get_coordinator_info"
 SERVICE_CLEAR_CACHE = "clear_cache"
 
-# Service schemas
+# Service schemas. device_name and device_id are both optional at the
+# schema level so either can be used as the target; the handlers enforce
+# that at least one is provided.
 SET_PARAMETER_SCHEMA = vol.Schema(
     {
-        vol.Required("device_name"): cv.string,
+        vol.Optional("device_name"): cv.string,
+        vol.Optional("device_id"): cv.string,
         vol.Required("parameter_name"): cv.string,
         vol.Required("value"): vol.Any(int, float, str, bool),
     }
@@ -34,7 +36,8 @@ SET_PARAMETER_SCHEMA = vol.Schema(
 
 GET_DEVICE_INFO_SCHEMA = vol.Schema(
     {
-        vol.Required("device_name"): cv.string,
+        vol.Optional("device_name"): cv.string,
+        vol.Optional("device_id"): cv.string,
         vol.Optional("include_config", default=True): cv.boolean,
     }
 )
@@ -42,18 +45,137 @@ GET_DEVICE_INFO_SCHEMA = vol.Schema(
 REFRESH_DEVICE_SCHEMA = vol.Schema(
     {
         vol.Optional("device_name"): cv.string,
+        vol.Optional("device_id"): cv.string,
     }
 )
 
 REFRESH_PARAMETERS_SCHEMA = vol.Schema(
     {
-        vol.Required("device_name"): cv.string,
+        vol.Optional("device_name"): cv.string,
+        vol.Optional("device_id"): cv.string,
     }
 )
 
 GET_COORDINATOR_INFO_SCHEMA = vol.Schema({})
 
 CLEAR_CACHE_SCHEMA = vol.Schema({})  # No parameters needed
+
+
+def _iter_coordinators(hass: HomeAssistant) -> list[Any]:
+    """Return every loaded coordinator."""
+    return [
+        coord
+        for coord in hass.data.get(DOMAIN, {}).values()
+        if hasattr(coord, "client")
+    ]
+
+
+def _find_in_coordinator_data(
+    coordinators: list[Any], *, device_id: str | None, device_name: str | None
+) -> tuple[Any, dict[str, Any]] | None:
+    """Resolve a device from already-fetched coordinator data.
+
+    Local resolution needs no cloud round-trip and, when a device_id is
+    supplied, is immune to duplicate device names.
+    """
+    if device_id is not None:
+        for coord in coordinators:
+            for info in (coord.data or {}).values():
+                if str(info.get("device_id")) == str(device_id):
+                    return coord, info
+        return None
+    if device_name is None:
+        return None
+    for coord in coordinators:
+        for info in (coord.data or {}).values():
+            if info.get("name") == device_name:
+                return coord, info
+    return None
+
+
+async def _resolve_target(
+    hass: HomeAssistant,
+    call: ServiceCall,
+) -> tuple[Any, dict[str, Any]]:
+    """Return (coordinator, device_info) for the device targeted by a call."""
+    device_name = call.data.get("device_name")
+    device_id = call.data.get("device_id")
+    if not device_name and not device_id:
+        raise HomeAssistantError("Specify either device_name or device_id")
+
+    coordinators = _iter_coordinators(hass)
+
+    local = _find_in_coordinator_data(
+        coordinators, device_id=device_id, device_name=device_name
+    )
+    if local is not None:
+        return local
+
+    if device_id is not None:
+        raise HomeAssistantError(f"Device id {device_id} not found in any coordinator")
+
+    # Legacy fallback: the device may exist in the cloud inventory but not
+    # yet in coordinator data (e.g. added after the last refresh).
+    for coord in coordinators:
+        try:
+            device = await hass.async_add_executor_job(
+                coord.client.find_device_by_name, device_name
+            )
+        except Exception as err:
+            _LOGGER.debug("Error finding device in coordinator: %s", err)
+            continue
+        if device:
+            return coord, device
+
+    raise HomeAssistantError(f"Device {device_name} not found in any coordinator")
+
+
+def _read_configuration(client: Any, serial_number: str) -> dict:
+    """Read and format a device's IoT configuration by serial number."""
+    from cloudedge.iot_parameters import get_parameter_name, format_parameter_value
+
+    try:
+        config = client.get_device_config(serial_number)
+    except Exception as err:
+        _LOGGER.debug("Config read failed for %s: %s", serial_number, err)
+        return {}
+
+    iot_data = None
+    if isinstance(config, dict):
+        if "result" in config and "iot" in config["result"]:
+            iot_data = config["result"]["iot"]
+        elif "iot" in config:
+            iot_data = config["iot"]
+        elif any(key.isdigit() for key in config.keys()):
+            iot_data = config
+    if not isinstance(iot_data, dict):
+        return {}
+
+    return {
+        code: {
+            "name": get_parameter_name(code),
+            "code": code,
+            "value": value,
+            "formatted": format_parameter_value(get_parameter_name(code), value),
+        }
+        for code, value in iot_data.items()
+    }
+
+
+def _read_device_info_by_identity(
+    client: Any, device: dict[str, Any], include_config: bool
+) -> dict[str, Any]:
+    """Assemble device info from the exact identity, immune to duplicate names."""
+    info = dict(device)
+    try:
+        status = client.get_device_status(device["device_id"])
+        if status:
+            info.update(status)
+    except Exception as err:
+        _LOGGER.debug("Status read failed for %s: %s", device.get("serial_number"), err)
+    if include_config:
+        info["configuration"] = _read_configuration(client, device["serial_number"])
+    return info
 
 
 async def async_setup_services(hass: HomeAssistant) -> None:
@@ -66,97 +188,80 @@ async def async_setup_services(hass: HomeAssistant) -> None:
 
     async def async_set_parameter(call: ServiceCall) -> None:
         """Set a device parameter."""
-        device_name = call.data["device_name"]
         parameter_name = call.data["parameter_name"]
         value = call.data["value"]
 
+        coordinator, device = await _resolve_target(hass, call)
+        label = call.data.get("device_id") or call.data.get("device_name")
+
+        serial_number = device.get("serial_number")
+        if not serial_number:
+            raise HomeAssistantError(f"Device {label} has no serial number")
+
+        from cloudedge.iot_parameters import get_parameter_code_by_name
+
+        parameter_code = get_parameter_code_by_name(parameter_name)
+        if parameter_code is None:
+            raise HomeAssistantError(
+                f"Unknown parameter {parameter_name}; use an IoT parameter name "
+                "such as FRONT_LIGHT_SWITCH or MOTION_DET_ENABLE"
+            )
+        # Encode boolean switch states as integers while preserving text
+        # and fractional values for other IoT parameters.
+        value = int(value) if isinstance(value, bool) else value
         _LOGGER.debug(
-            "Setting parameter %s to %s for device %s",
+            "Setting parameter %s (%s) to %s for device %s",
             parameter_name,
+            parameter_code,
             value,
-            device_name,
+            label,
         )
-
-        # Find the coordinator for this device
-        coordinator = None
-        for entry_id, coord in hass.data[DOMAIN].items():
-            if hasattr(coord, "client"):
-                try:
-                    device = await hass.async_add_executor_job(
-                        coord.client.find_device_by_name, device_name
-                    )
-                    if device:
-                        coordinator = coord
-                        break
-                except Exception as e:
-                    _LOGGER.debug("Error finding device in coordinator %s: %s", entry_id, e)
-
-        if not coordinator:
-            raise HomeAssistantError(f"Device {device_name} not found in any coordinator")
-
-        try:
-            success = await hass.async_add_executor_job(
-                coordinator.client.set_device_parameter,
-                device_name,
-                parameter_name,
-                value,
-            )
-        except Exception as e:
-            raise HomeAssistantError(
-                f"Error setting parameter {parameter_name} for device {device_name}: {e}"
-            ) from e
-
-        if not success:
-            raise HomeAssistantError(
-                f"Failed to set {parameter_name} to {value} for device {device_name}"
-            )
+        # Route through the coordinator so the write targets the exact
+        # device (serial number + device_id), even when several devices
+        # share the same name. Pass the resolved identity: the fallback
+        # device may not be in coordinator data yet.
+        await coordinator.async_set_device_parameter(
+            serial_number, parameter_code, value, device=device
+        )
+        await coordinator.async_request_refresh()
 
         _LOGGER.info(
             "Successfully set %s to %s for device %s",
             parameter_name,
             value,
-            device_name,
+            label,
         )
-        # Refresh the coordinator to update entity states
-        await coordinator.async_request_refresh()
 
     async def async_get_device_info(call: ServiceCall) -> None:
         """Get device information."""
-        device_name = call.data["device_name"]
         include_config = call.data.get("include_config", True)
 
-        _LOGGER.debug("Getting device info for %s", device_name)
+        coordinator, device = await _resolve_target(hass, call)
+        label = call.data.get("device_id") or call.data.get("device_name")
+        device_name = device.get("name", label)
 
-        # Find the coordinator for this device
-        coordinator = None
-        for entry_id, coord in hass.data[DOMAIN].items():
-            if hasattr(coord, "client"):
-                try:
-                    device = await hass.async_add_executor_job(
-                        coord.client.find_device_by_name, device_name
-                    )
-                    if device:
-                        coordinator = coord
-                        break
-                except Exception as e:
-                    _LOGGER.debug("Error finding device in coordinator %s: %s", entry_id, e)
+        def _read() -> dict[str, Any] | None:
+            try:
+                info = coordinator.client.get_device_info(device_name, include_config)
+            except Exception as err:
+                _LOGGER.debug("get_device_info failed for %s: %s", label, err)
+                info = None
+            if info is None or (
+                device.get("device_id") is not None
+                and str(info.get("device_id")) != str(device.get("device_id"))
+            ):
+                # Duplicate names made the library resolve a different
+                # device: re-read through the exact identity that
+                # _resolve_target selected.
+                info = _read_device_info_by_identity(
+                    coordinator.client, device, include_config
+                )
+            return info
 
-        if not coordinator:
-            raise HomeAssistantError(f"Device {device_name} not found in any coordinator")
-
-        try:
-            device_info = await hass.async_add_executor_job(
-                coordinator.client.get_device_info,
-                device_name,
-                include_config,
-            )
-        except Exception as e:
-            raise HomeAssistantError(
-                f"Error getting device info for {device_name}: {e}"
-            ) from e
+        device_info = await hass.async_add_executor_job(_read)
 
         if not device_info:
-            raise HomeAssistantError(f"Failed to get device info for {device_name}")
+            raise HomeAssistantError(f"Failed to get device info for {label}")
 
         _LOGGER.info("Device info for %s: %s", device_name, device_info)
         # You could emit an event here with the device info
@@ -170,62 +275,31 @@ async def async_setup_services(hass: HomeAssistant) -> None:
 
     async def async_refresh_device(call: ServiceCall) -> None:
         """Refresh device data."""
-        device_name = call.data.get("device_name")
-
-        if device_name:
-            _LOGGER.debug("Refreshing data for device %s", device_name)
-            # Find the coordinator for this specific device
-            coordinator = None
-            for entry_id, coord in hass.data[DOMAIN].items():
-                if hasattr(coord, "client"):
-                    try:
-                        device = await hass.async_add_executor_job(
-                            coord.client.find_device_by_name, device_name
-                        )
-                        if device:
-                            coordinator = coord
-                            break
-                    except Exception as e:
-                        _LOGGER.debug("Error finding device in coordinator %s: %s", entry_id, e)
-
-            if coordinator:
-                await coordinator.async_request_refresh()
-                _LOGGER.info("Refreshed data for device %s", device_name)
-            else:
-                raise HomeAssistantError(f"Device {device_name} not found")
-        else:
+        if not call.data.get("device_name") and not call.data.get("device_id"):
             # Refresh all coordinators
             _LOGGER.debug("Refreshing data for all devices")
-            for coord in hass.data[DOMAIN].values():
+            for coord in _iter_coordinators(hass):
                 if hasattr(coord, "async_request_refresh"):
                     await coord.async_request_refresh()
             _LOGGER.info("Refreshed data for all devices")
+            return
+
+        coordinator, device = await _resolve_target(hass, call)
+        await coordinator.async_request_refresh()
+        _LOGGER.info("Refreshed data for device %s", device.get("name"))
 
     async def async_refresh_parameters(call: ServiceCall) -> None:
         """Refresh parameters for a specific device."""
-        device_name = call.data["device_name"]
-        _LOGGER.debug("Refreshing parameters for device %s", device_name)
-        
-        # Find the coordinator for this device
-        coordinator = None
-        for entry_id, coord in hass.data[DOMAIN].items():
-            if hasattr(coord, "client") and hasattr(coord, "async_refresh_device_config"):
-                try:
-                    # Check if this coordinator has the device
-                    device = await hass.async_add_executor_job(
-                        coord.client.find_device_by_name, device_name
-                    )
-                    if device:
-                        coordinator = coord
-                        break
-                except Exception as e:
-                    _LOGGER.debug("Error finding device in coordinator %s: %s", entry_id, e)
-
-        if not coordinator:
-            raise HomeAssistantError(f"Device {device_name} not found in any coordinator")
+        coordinator, device = await _resolve_target(hass, call)
+        device_name = device.get("name")
+        serial_number = device.get("serial_number")
+        if not serial_number:
+            raise HomeAssistantError(f"Device {device_name} has no serial number")
 
         # Use the coordinator's targeted refresh method
-        success = await coordinator.async_refresh_device_config(device_name)
+        success = await coordinator.async_refresh_device_config(
+            device_name, serial_number=serial_number
+        )
 
         if not success:
             raise HomeAssistantError(
@@ -233,14 +307,12 @@ async def async_setup_services(hass: HomeAssistant) -> None:
             )
         _LOGGER.info("Successfully refreshed parameters for device %s", device_name)
 
-    
-
     def _all_coordinators() -> list[Any]:
         """Return every loaded coordinator, not just the first one."""
         return [
             hass.data[DOMAIN][config_entry.entry_id]
             for config_entry in hass.config_entries.async_entries(DOMAIN)
-            if config_entry.entry_id in hass.data[DOMAIN]
+            if config_entry.entry_id in hass.data.get(DOMAIN, {})
         ]
 
     async def async_get_coordinator_info(call: ServiceCall) -> None:
@@ -308,7 +380,7 @@ async def async_setup_services(hass: HomeAssistant) -> None:
         async_get_coordinator_info,
         schema=GET_COORDINATOR_INFO_SCHEMA,
     )
-    
+
     hass.services.async_register(
         DOMAIN,
         SERVICE_CLEAR_CACHE,

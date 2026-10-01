@@ -18,6 +18,7 @@ from .const import (
     SWITCH_PARAMETERS,
     ENABLED_BY_DEFAULT_SWITCH_PARAMS,
 )
+from .entity import CloudEdgeEntityMixin
 from cloudedge.iot_parameters import (
     IOT_PARAMETERS,
     BOOLEAN_PARAMETERS,
@@ -92,7 +93,9 @@ async def async_setup_entry(
     _async_add_missing()
 
 
-class CloudEdgeBaseSwitch(CoordinatorEntity[CloudEdgeCoordinator], SwitchEntity):
+class CloudEdgeBaseSwitch(
+    CloudEdgeEntityMixin, CoordinatorEntity[CloudEdgeCoordinator], SwitchEntity
+):
     """Base class for CloudEdge switches."""
 
     _attr_has_entity_name = True
@@ -107,18 +110,6 @@ class CloudEdgeBaseSwitch(CoordinatorEntity[CloudEdgeCoordinator], SwitchEntity)
         super().__init__(coordinator)
         self._serial_number = serial_number
         self._device_info = device_info
-
-    @property
-    def device_info(self) -> dict[str, Any]:
-        """Return device information."""
-        return {
-            "identifiers": {(DOMAIN, self._serial_number)},
-            "name": self._device_info.get("name", f"Camera {self._serial_number}"),
-            "manufacturer": "CloudEdge",
-            "model": self._device_info.get("type", "SmartEye Camera"),
-            "serial_number": self._serial_number,
-            "sw_version": self._device_info.get("firmware_version"),
-        }
 
     @property
     def available(self) -> bool:

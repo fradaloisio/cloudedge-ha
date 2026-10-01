@@ -16,6 +16,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from . import CloudEdgeCoordinator
 from .const import DOMAIN
+from .entity import CloudEdgeEntityMixin, is_camera_device
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -83,44 +84,38 @@ async def async_setup_entry(
     """Set up CloudEdge camera platform."""
     coordinator: CloudEdgeCoordinator = hass.data[DOMAIN][config_entry.entry_id]
 
-    # Handle case where coordinator.data might be None
     if not coordinator.data:
         _LOGGER.warning("No device data available yet, camera entities will be added when data is available")
-        
-        # Add a listener to create entities when data becomes available.
-        # Must be a sync @callback: async_add_listener invokes listeners
-        # synchronously, so an async def would never be awaited.
-        @callback
-        def _handle_coordinator_update() -> None:
-            if coordinator.data and not getattr(coordinator, '_cameras_added', False):
-                _LOGGER.info("Device data is now available, adding camera entities")
-                cameras = []
-                for serial_number, device_info in coordinator.data.items():
-                    # Only add camera devices
-                    if device_info.get("type_id") in [1, 2, 3, 4, 5]:  # Common camera type IDs
-                        camera = CloudEdgeCamera(coordinator, serial_number, device_info)
-                        cameras.append(camera)
-                        _LOGGER.debug("Added camera: %s", device_info.get("name"))
-                if cameras:
-                    async_add_entities(cameras)
-                    coordinator._cameras_added = True
-        
-        coordinator.async_add_listener(_handle_coordinator_update)
-        async_add_entities([])
-        return
 
-    cameras = []
-    for serial_number, device_info in coordinator.data.items():
-        # Only add camera devices
-        if device_info.get("type_id") in [1, 2, 3, 4, 5]:  # Common camera type IDs
-            camera = CloudEdgeCamera(coordinator, serial_number, device_info)
-            cameras.append(camera)
-            _LOGGER.debug("Added camera: %s", device_info.get("name"))
+    added: set[str] = set()
 
-    async_add_entities(cameras)
+    def _build_cameras() -> list[CloudEdgeCamera]:
+        return [
+            CloudEdgeCamera(coordinator, serial_number, device_info)
+            for serial_number, device_info in (coordinator.data or {}).items()
+            # Only add camera devices
+            if is_camera_device(device_info)
+        ]
+
+    # Listener must be a sync @callback: async_add_listener invokes
+    # listeners synchronously, so an async def would never be awaited.
+    # It re-evaluates the inventory on every update, so cameras discovered
+    # later (sleeping devices, newly paired) get entities without a reload.
+    @callback
+    def _async_add_missing() -> None:
+        cameras = [camera for camera in _build_cameras() if camera.unique_id not in added]
+        if cameras:
+            added.update(camera.unique_id for camera in cameras)
+            _LOGGER.info("Adding %d newly discovered camera entities", len(cameras))
+            async_add_entities(cameras)
+
+    config_entry.async_on_unload(coordinator.async_add_listener(_async_add_missing))
+    _async_add_missing()
 
 
-class CloudEdgeCamera(CoordinatorEntity[CloudEdgeCoordinator], Camera):
+class CloudEdgeCamera(
+    CloudEdgeEntityMixin, CoordinatorEntity[CloudEdgeCoordinator], Camera
+):
     """Representation of a CloudEdge camera."""
 
     _attr_has_entity_name = True
@@ -135,24 +130,12 @@ class CloudEdgeCamera(CoordinatorEntity[CloudEdgeCoordinator], Camera):
         """Initialize the camera."""
         super().__init__(coordinator)
         Camera.__init__(self)
-        
+
         self._serial_number = serial_number
         self._device_info = device_info
         self._attr_unique_id = f"{DOMAIN}_{serial_number}_camera"
         self._attr_name = device_info.get("name", f"Camera {serial_number}")
         self._last_image: bytes | None = None
-
-    @property
-    def device_info(self) -> dict[str, Any]:
-        """Return device information."""
-        return {
-            "identifiers": {(DOMAIN, self._serial_number)},
-            "name": self._device_info.get("name", f"Camera {self._serial_number}"),
-            "manufacturer": "CloudEdge",
-            "model": self._device_info.get("type", "SmartEye Camera"),
-            "serial_number": self._serial_number,
-            "sw_version": self._device_info.get("firmware_version"),
-        }
 
     @property
     def available(self) -> bool:

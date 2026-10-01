@@ -1,14 +1,16 @@
 """
-CloudEdgeintegration for Home Assistant.
+CloudEdge integration for Home Assistant.
 
-This integration provides support forCloudEdge cameras and IoT devices,
+This integration provides support for CloudEdge cameras and IoT devices,
 allowing you to monitor and control your devices through Home Assistant.
 """
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from functools import partial
@@ -72,19 +74,30 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     except Exception as err:
         raise ConfigEntryNotReady(f"CloudEdge not reachable: {err}") from err
 
-    # Fetch initial data with error handling
-    success = await coordinator.async_safe_first_refresh()
-    if not success:
-        _LOGGER.warning("Initial setup had issues, integration will retry on next update")
+    try:
+        # Fetch initial data with error handling
+        success = await coordinator.async_safe_first_refresh()
+        if not success:
+            _LOGGER.warning("Initial setup had issues, integration will retry on next update")
 
-    hass.data[DOMAIN][entry.entry_id] = coordinator
+        hass.data[DOMAIN][entry.entry_id] = coordinator
 
-    # Set up platforms even if initial refresh failed
-    # This allows the integration to load and retry later
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+        # Set up platforms even if initial refresh failed
+        # This allows the integration to load and retry later
+        await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
-    # Set up services
-    await async_setup_services(hass)
+        # Set up services
+        await async_setup_services(hass)
+    except BaseException:
+        # Setup aborted, so async_unload_entry will never run for this
+        # entry. Stop the transports started during validation, otherwise
+        # the MQTT thread and stream bridges outlive the coordinator.
+        hass.data[DOMAIN].pop(entry.entry_id, None)
+        with contextlib.suppress(Exception):
+            await hass.async_add_executor_job(coordinator._stop_mqtt)
+        with contextlib.suppress(Exception):
+            await hass.async_add_executor_job(coordinator.stop_streams)
+        raise
 
     return True
 
@@ -96,9 +109,10 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # session per account — wiping the cache forces a fresh login that
     # logs out the vendor app. Cache removal lives in async_remove_entry.
     if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
-        coordinator = hass.data[DOMAIN].pop(entry.entry_id)
-        await hass.async_add_executor_job(coordinator._stop_mqtt)
-        await hass.async_add_executor_job(coordinator.stop_streams)
+        coordinator = hass.data[DOMAIN].pop(entry.entry_id, None)
+        if coordinator is not None:
+            await hass.async_add_executor_job(coordinator._stop_mqtt)
+            await hass.async_add_executor_job(coordinator.stop_streams)
         # Services are domain-wide: remove them only with the last entry
         if not hass.data[DOMAIN]:
             await async_unload_services(hass)
@@ -165,6 +179,10 @@ class CloudEdgeCoordinator(DataUpdateCoordinator):
         self._last_updated_device = None  # Track which device was last updated
         self._last_update_time: datetime | None = None
         self._mqtt_listener = None
+        # Guards _fetch_data: a coordinator-level timeout abandons the
+        # executor thread but cannot cancel it, so a slow fetch must never
+        # overlap the next attempt and race on client/session state.
+        self._fetch_lock = threading.Lock()
         self._stream_manager = CloudEdgeStreamManager(self)
         
         _LOGGER.info(
@@ -246,6 +264,8 @@ class CloudEdgeCoordinator(DataUpdateCoordinator):
 
     async def _async_update_data(self) -> Dict[str, Any]:
         """Update data via library."""
+        from cloudedge.exceptions import AuthenticationError
+
         _LOGGER.debug("Starting data update cycle")
         try:
             # Add timeout to prevent hanging during Home Assistant startup/shutdown
@@ -267,6 +287,20 @@ class CloudEdgeCoordinator(DataUpdateCoordinator):
         except asyncio.TimeoutError:
             _LOGGER.error("Data update timed out after 60 seconds")
             raise UpdateFailed("CloudEdge API timeout - check network connectivity")
+        except AuthenticationError as exception:
+            # ConfigEntryAuthFailed tells Home Assistant to start the reauth
+            # flow and surface it as an attention item in Settings. Keep
+            # connectivity/API failures as UpdateFailed so transient outages do
+            # not incorrectly ask the user to replace valid credentials.
+            _LOGGER.error("CloudEdge authentication failed: %s", exception)
+            self._authenticated = False
+            raise ConfigEntryAuthFailed(
+                "CloudEdge authentication failed; reauthentication is required"
+            ) from exception
+        except UpdateFailed:
+            # Already a coordinator failure with a specific message raised
+            # by _fetch_data: pass it through instead of re-wrapping it.
+            raise
         except Exception as exception:
             _LOGGER.error("Data update failed: %s", exception)
             # Reset authentication on certain errors to force re-auth on next update
@@ -524,41 +558,13 @@ class CloudEdgeCoordinator(DataUpdateCoordinator):
 
         # ── 2. OpenAPI status ───────────────────────────────────────────
         try:
+            # The pinned pycloudedge provides this method; when absent,
+            # fall through to the heuristic below.
             if hasattr(self.client, "get_device_online_status"):
                 api_status = self.client.get_device_online_status(serial_number)
                 if api_status in ("online", "offline"):
                     return api_status
                 # "dormancy" falls through to heuristic below
-
-            else:
-                # Inline fallback for older pycloudedge
-                import base64 as _b64
-                import hashlib as _hl
-                import hmac as _hmac
-
-                iot_keys = (self.client.session_data or {}).get("iotPlatformKeys", {})
-                if iot_keys and "accessid" in iot_keys and "accesskey" in iot_keys:
-                    access_id = iot_keys["accessid"]
-                    access_key = iot_keys["accesskey"]
-                    timeout = str(int(time.time()) + 60)
-                    formatted_sn = self.client._format_sn(serial_number)
-                    string_to_sign = f"GET\n\n\n{timeout}\n/openapi/device/status\nquery"
-                    sig = _b64.b64encode(
-                        _hmac.new(access_key.encode(), string_to_sign.encode(), _hl.sha1).digest()
-                    ).decode()
-                    resp = self.client._session.get(
-                        f"{self.client.OPENAPI_BASE_URL}/openapi/device/status",
-                        params={
-                            "accessid": access_id, "expires": timeout,
-                            "signature": sig, "action": "query",
-                            "deviceid": formatted_sn,
-                        },
-                        timeout=10,
-                    )
-                    if resp.status_code == 200:
-                        api_status = resp.json().get("status", "unknown")
-                        if api_status in ("online", "offline"):
-                            return api_status
         except Exception as exc:
             _LOGGER.debug("connection_status API fetch failed for %s: %s", serial_number, exc)
 
@@ -571,6 +577,21 @@ class CloudEdgeCoordinator(DataUpdateCoordinator):
         return "dormancy"
 
     def _fetch_data(self) -> Dict[str, Any]:
+        """Fetch data from CloudEdge API (one attempt at a time)."""
+        if not self._fetch_lock.acquire(blocking=False):
+            # A previous fetch timed out at the coordinator level but its
+            # executor thread kept running. Two overlapping fetches would
+            # race on client/session state.
+            raise UpdateFailed(
+                "Previous CloudEdge data fetch is still in progress; "
+                "skipping this update"
+            )
+        try:
+            return self._fetch_data_locked()
+        finally:
+            self._fetch_lock.release()
+
+    def _fetch_data_locked(self) -> Dict[str, Any]:
         """Fetch data from CloudEdge API."""
         start_time = time.time()
         _LOGGER.debug("Starting CloudEdge API data fetch")
@@ -630,12 +651,24 @@ class CloudEdgeCoordinator(DataUpdateCoordinator):
                     if not success:
                         raise AuthenticationError("Authentication failed")
                     _LOGGER.info("Successfully authenticated with CloudEdge API")
-                except Exception as auth_error:
-                    _LOGGER.error("Authentication failed: %s", auth_error)
-                    # Reset authentication state
+                except AuthenticationError:
+                    # Credentials rejected by the server: only this case may
+                    # reach the coordinator as ConfigEntryAuthFailed.
+                    _LOGGER.error("CloudEdge authentication failed")
                     self._authenticated = False
-                    self.client.session_data = None
-                    raise AuthenticationError(f"Authentication failed: {auth_error}")
+                    raise
+                except Exception as auth_error:
+                    # Login failed for a transient reason (network outage,
+                    # API error): report it as UpdateFailed so polling
+                    # continues and the user is NOT asked to replace valid
+                    # credentials.
+                    _LOGGER.warning(
+                        "CloudEdge login attempt failed (transient): %s", auth_error
+                    )
+                    self._authenticated = False
+                    raise UpdateFailed(
+                        f"CloudEdge login failed: {auth_error}"
+                    ) from auth_error
 
             # Get all devices from all homes
             _LOGGER.debug("Fetching device data from CloudEdge API")
@@ -785,6 +818,22 @@ class CloudEdgeCoordinator(DataUpdateCoordinator):
 
             self._stream_manager.remove_missing(set(device_data))
 
+            # Recover a failed login-time IoT fetch before retrying MQTT.
+            # The library owns refresh throttling and credential locking;
+            # older releases can only retry with their cached configuration.
+            if self._mqtt_listener is None and self.client is not None:
+                try:
+                    refresh_mqtt = getattr(self.client, "refresh_mqtt_config", None)
+                    mqtt_config = (
+                        refresh_mqtt()
+                        if callable(refresh_mqtt)
+                        else self.client.get_mqtt_config()
+                    )
+                    if mqtt_config:
+                        self._start_mqtt()
+                except Exception as exc:
+                    _LOGGER.debug("Deferred MQTT start failed: %s", exc)
+
             fetch_time = time.time() - start_time
             _LOGGER.info(
                 "Successfully fetched data for %d devices in %.2f seconds",
@@ -797,7 +846,14 @@ class CloudEdgeCoordinator(DataUpdateCoordinator):
             _LOGGER.error("Authentication failed: %s", e)
             self._authenticated = False
             self._force_auth_refresh = True
-            raise UpdateFailed(f"Authentication failed: {e}")
+            # Preserve the exception type across the executor boundary. The
+            # async coordinator converts it to ConfigEntryAuthFailed, which is
+            # the Home Assistant signal that creates a reauthentication alert.
+            raise
+        except UpdateFailed:
+            # Raised directly by this fetch (e.g. transient login failure):
+            # pass through with its specific message.
+            raise
         except CloudEdgeError as e:
             _LOGGER.error("CloudEdge API error: %s", e)
             raise UpdateFailed(f"CloudEdge API error: {e}")
@@ -931,11 +987,26 @@ class CloudEdgeCoordinator(DataUpdateCoordinator):
         return None
 
     async def async_set_device_parameter(
-        self, serial_number: str, parameter_code: str, value: int
+        self,
+        serial_number: str,
+        parameter_code: str,
+        value: int | float | str | bool,
+        *,
+        device: dict[str, Any] | None = None,
     ) -> None:
         """Control the entity's exact device, including accounts with duplicate names."""
-        device = (self.data or {}).get(serial_number)
-        if self.client is None or device is None:
+        if self.client is None:
+            raise HomeAssistantError(f"Device {serial_number} is not available")
+        if device is None:
+            device = (self.data or {}).get(serial_number)
+        if device is None:
+            # The caller resolved this device outside coordinator data (or
+            # the device has not been polled in yet): look it up in the live
+            # inventory rather than failing the write.
+            device = await self.hass.async_add_executor_job(
+                self.get_device_for_stream, serial_number
+            )
+        if device is None:
             raise HomeAssistantError(f"Device {serial_number} is not available")
         try:
             success = await self.hass.async_add_executor_job(partial(
@@ -1007,6 +1078,11 @@ class CloudEdgeCoordinator(DataUpdateCoordinator):
             _LOGGER.warning("Initial refresh timed out - will retry on next cycle")
             return False
         except asyncio.CancelledError:
+            raise
+        except ConfigEntryAuthFailed:
+            # Never downgrade an authentication failure to a best-effort first
+            # refresh: Home Assistant needs this exception to show reauth in
+            # Settings.
             raise
         except Exception as e:
             _LOGGER.error("First refresh failed: %s - will retry on next cycle", e)

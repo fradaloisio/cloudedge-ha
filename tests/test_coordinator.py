@@ -10,6 +10,8 @@ import pytest
 pytest.importorskip("homeassistant")
 
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryAuthFailed
+from homeassistant.helpers.update_coordinator import UpdateFailed
 from custom_components.cloudedge import CloudEdgeCoordinator, async_unload_entry
 from custom_components.cloudedge.const import DOMAIN
 
@@ -174,6 +176,115 @@ def test_regular_reauthentication_rotates_mqtt(tmp_path):
     asyncio.run(run())
 
 
+def test_runtime_login_failure_requests_reauthentication(tmp_path):
+    from cloudedge.exceptions import AuthenticationError
+
+    async def run():
+        coordinator = make_coordinator(tmp_path)
+        coordinator._fetch_data = Mock(
+            side_effect=AuthenticationError("invalid credentials")
+        )
+
+        with pytest.raises(ConfigEntryAuthFailed):
+            await coordinator._async_update_data()
+
+        assert coordinator._authenticated is False
+
+    asyncio.run(run())
+
+
+def test_fetch_preserves_authentication_failure_type(tmp_path):
+    from cloudedge.exceptions import AuthenticationError
+
+    async def run():
+        coordinator = make_coordinator(tmp_path)
+        coordinator._authenticated = False
+        coordinator.client.authenticate.return_value = False
+
+        with pytest.raises(AuthenticationError):
+            coordinator._fetch_data()
+
+        assert coordinator._force_auth_refresh is True
+        # The client owns session replacement under its own synchronization.
+        assert coordinator.client.session_data is not None
+
+    asyncio.run(run())
+
+
+def test_network_error_during_login_is_transient_not_reauth(tmp_path):
+    from cloudedge.exceptions import NetworkError
+
+    async def run():
+        coordinator = make_coordinator(tmp_path)
+        coordinator._authenticated = False
+        coordinator.client.authenticate.side_effect = NetworkError("connection reset")
+
+        with pytest.raises(UpdateFailed, match="login failed"):
+            coordinator._fetch_data()
+
+        # A transient outage must not arm forced re-authentication nor
+        # reach the coordinator as ConfigEntryAuthFailed (which would stop
+        # polling and ask the user to replace valid credentials).
+        assert coordinator._force_auth_refresh is False
+
+    asyncio.run(run())
+
+
+def test_update_data_maps_network_error_to_update_failed(tmp_path):
+    from cloudedge.exceptions import NetworkError
+
+    async def run():
+        coordinator = make_coordinator(tmp_path)
+        coordinator._fetch_data = Mock(side_effect=NetworkError("dns failure"))
+        with pytest.raises(UpdateFailed):
+            await coordinator._async_update_data()
+
+    asyncio.run(run())
+
+
+def test_set_parameter_for_device_not_yet_polled_in(tmp_path):
+    async def run():
+        coordinator = make_coordinator(tmp_path)
+        coordinator.data = {}
+        loop_thread = threading.get_ident()
+        lookup_threads = []
+
+        def get_inventory():
+            lookup_threads.append(threading.get_ident())
+            return [
+                {"serial_number": "sn-g", "device_id": "id-g", "name": "Garage"}
+            ]
+
+        coordinator.client.get_all_devices.side_effect = get_inventory
+        coordinator.client.set_device_config.return_value = True
+
+        await coordinator.async_set_device_parameter("sn-g", "103", 1)
+
+        coordinator.client.set_device_config.assert_called_once_with(
+            "sn-g", {"103": 1}, device_id="id-g"
+        )
+        assert len(lookup_threads) == 1
+        assert lookup_threads[0] != loop_thread
+
+    asyncio.run(run())
+
+
+def test_set_parameter_with_unknown_serial_fails_cleanly(tmp_path):
+    from homeassistant.exceptions import HomeAssistantError
+
+    async def run():
+        coordinator = make_coordinator(tmp_path)
+        coordinator.data = {}
+        coordinator.client.get_all_devices.return_value = []
+
+        with pytest.raises(HomeAssistantError, match="not available"):
+            await coordinator.async_set_device_parameter("sn-x", "103", 1)
+
+        coordinator.client.set_device_config.assert_not_called()
+
+    asyncio.run(run())
+
+
 def test_failed_unload_keeps_transports_running(tmp_path):
     async def run():
         coordinator = make_coordinator(tmp_path)
@@ -204,6 +315,100 @@ def test_first_refresh_propagates_cancellation(tmp_path):
     asyncio.run(run())
 
 
+def test_first_refresh_propagates_authentication_failure(tmp_path):
+    async def run():
+        coordinator = make_coordinator(tmp_path)
+        coordinator.async_config_entry_first_refresh = AsyncMock(
+            side_effect=ConfigEntryAuthFailed("reauth required")
+        )
+        with pytest.raises(ConfigEntryAuthFailed):
+            await coordinator.async_safe_first_refresh()
+
+    asyncio.run(run())
+
+
+def test_setup_auth_failure_stops_transports(tmp_path):
+    from custom_components.cloudedge import async_setup_entry
+
+    async def run():
+        hass = HomeAssistant(str(tmp_path))
+        hass.data = {DOMAIN: {}}
+        hass.config_entries = Mock()
+        hass.config_entries.async_forward_entry_setups = AsyncMock()
+        entry = Mock(entry_id="test-entry")
+        entry.data = {
+            "username": "user@example.test",
+            "password": "password",
+            "country_code": "IT",
+            "phone_code": "+39",
+        }
+        stop_mqtt = Mock()
+        stop_streams = Mock()
+        with patch("homeassistant.helpers.frame.report_usage"), \
+             patch.object(CloudEdgeCoordinator, "async_validate_authentication", AsyncMock()), \
+             patch.object(CloudEdgeCoordinator, "_stop_mqtt", stop_mqtt), \
+             patch.object(CloudEdgeCoordinator, "stop_streams", stop_streams), \
+             patch.object(
+                 CloudEdgeCoordinator,
+                 "async_config_entry_first_refresh",
+                 AsyncMock(side_effect=ConfigEntryAuthFailed("reauth")),
+             ), \
+             patch("custom_components.cloudedge.async_setup_services", AsyncMock()):
+            with pytest.raises(ConfigEntryAuthFailed):
+                await async_setup_entry(hass, entry)
+        # async_unload_entry never runs for a failed setup: transports must
+        # have been stopped here or they would outlive the coordinator.
+        stop_mqtt.assert_called()
+        stop_streams.assert_called()
+        assert entry.entry_id not in hass.data[DOMAIN]
+
+    asyncio.run(run())
+
+
+def test_unload_tolerates_missing_coordinator(tmp_path):
+    async def run():
+        coordinator = make_coordinator(tmp_path)
+        coordinator._stop_mqtt = Mock()
+        coordinator.stop_streams = Mock()
+        hass = coordinator.hass
+        hass.data[DOMAIN] = {}  # entry already gone from hass.data
+        hass.config_entries = Mock()
+        hass.config_entries.async_unload_platforms = AsyncMock(return_value=True)
+
+        assert await async_unload_entry(hass, coordinator.config_entry) is True
+        coordinator._stop_mqtt.assert_not_called()
+
+    asyncio.run(run())
+
+
+def test_second_fetch_while_previous_is_running_is_rejected(tmp_path):
+    async def run():
+        coordinator = make_coordinator(tmp_path)
+        coordinator.client.get_all_devices.return_value = []
+        assert coordinator._fetch_lock.acquire(blocking=False)
+        try:
+            with pytest.raises(UpdateFailed, match="still in progress"):
+                coordinator._fetch_data()
+        finally:
+            coordinator._fetch_lock.release()
+        # Lock released: the next update fetches normally again.
+        assert coordinator._fetch_data() == {}
+
+    asyncio.run(run())
+
+
+def test_update_failed_from_fetch_is_not_rewrapped(tmp_path):
+    async def run():
+        coordinator = make_coordinator(tmp_path)
+        original = UpdateFailed("cloud down")
+        coordinator._fetch_data = Mock(side_effect=original)
+        with pytest.raises(UpdateFailed) as excinfo:
+            await coordinator._async_update_data()
+        assert excinfo.value is original
+
+    asyncio.run(run())
+
+
 def test_diagnostics_work_before_and_after_refresh(tmp_path):
     async def run():
         coordinator = make_coordinator(tmp_path)
@@ -228,5 +433,49 @@ def test_runtime_update_reads_current_data_on_event_loop(tmp_path):
         assert old_data["sn"]["connection_status"] == "offline"
         assert publish.call_args.args[0]["sn"]["last_motion_time"] == 42
         assert publish.call_args.args[0]["sn"]["connection_status"] == "online"
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("recovery", ["available", "missing", "network_error", "legacy"])
+def test_poll_recovers_missing_mqtt_without_disrupting_inventory(tmp_path, recovery):
+    from cloudedge.exceptions import NetworkError
+
+    async def run():
+        coordinator = make_coordinator(tmp_path)
+        coordinator.client.get_all_devices.return_value = []
+        config = {"mqtt_host": "mqtt.example.test"}
+        coordinator.client.get_mqtt_config.return_value = (
+            config if recovery == "legacy" else None
+        )
+
+        def recover():
+            if recovery == "network_error":
+                raise NetworkError("temporarily unavailable")
+            if recovery == "available":
+                coordinator.client.get_mqtt_config.return_value = config
+                return config
+            return None
+
+        if recovery == "legacy":
+            del coordinator.client.refresh_mqtt_config
+        else:
+            coordinator.client.refresh_mqtt_config.side_effect = recover
+
+        with patch("cloudedge.mqtt.CloudEdgeMqttListener") as listener_type:
+            listener = listener_type.return_value
+            listener.start.return_value = True
+            assert coordinator._fetch_data() == {}
+            if recovery in {"available", "legacy"}:
+                assert coordinator._mqtt_listener is listener
+                listener.start.assert_called_once()
+                # An established listener must not trigger more recovery work.
+                assert coordinator._fetch_data() == {}
+                listener.start.assert_called_once()
+            else:
+                assert coordinator._mqtt_listener is None
+                listener_type.assert_not_called()
+            if recovery != "legacy":
+                coordinator.client.refresh_mqtt_config.assert_called_once()
 
     asyncio.run(run())

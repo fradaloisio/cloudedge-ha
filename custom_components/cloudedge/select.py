@@ -12,6 +12,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from . import CloudEdgeCoordinator
 from .const import DOMAIN
+from .entity import CloudEdgeEntityMixin, is_camera_device
 from .stream_bridge import (
     STREAM_PROFILE_AUTO,
     STREAM_PROFILE_OPTIONS,
@@ -31,24 +32,30 @@ async def async_setup_entry(
         return [
             CloudEdgeStreamProfileSelect(coordinator, serial_number, device_info)
             for serial_number, device_info in (coordinator.data or {}).items()
-            if device_info.get("type_id") in [1, 2, 3, 4, 5]
+            if is_camera_device(device_info)
         ]
 
-    if not coordinator.data:
-        @callback
-        def _async_add_when_ready() -> None:
-            if coordinator.data and not getattr(coordinator, "_selects_added", False):
-                coordinator._selects_added = True
-                async_add_entities(_build_selects())
+    added: set[str] = set()
 
-        coordinator.async_add_listener(_async_add_when_ready)
-        return
+    @callback
+    def _async_add_missing() -> None:
+        selects = [
+            select for select in _build_selects()
+            if select.unique_id not in added
+        ]
+        if selects:
+            added.update(select.unique_id for select in selects)
+            async_add_entities(selects)
 
-    async_add_entities(_build_selects())
+    config_entry.async_on_unload(coordinator.async_add_listener(_async_add_missing))
+    _async_add_missing()
 
 
 class CloudEdgeStreamProfileSelect(
-    CoordinatorEntity[CloudEdgeCoordinator], SelectEntity, RestoreEntity
+    CloudEdgeEntityMixin,
+    CoordinatorEntity[CloudEdgeCoordinator],
+    SelectEntity,
+    RestoreEntity,
 ):
     """Choose the native stream profile for one camera."""
 
@@ -67,18 +74,6 @@ class CloudEdgeStreamProfileSelect(
         self._serial_number = serial_number
         self._device_info = device_info
         self._attr_unique_id = f"{DOMAIN}_{serial_number}_stream_profile"
-
-    @property
-    def device_info(self) -> dict[str, Any]:
-        """Return the parent camera device information."""
-        return {
-            "identifiers": {(DOMAIN, self._serial_number)},
-            "name": self._device_info.get("name", f"Camera {self._serial_number}"),
-            "manufacturer": "CloudEdge",
-            "model": self._device_info.get("type", "SmartEye Camera"),
-            "serial_number": self._serial_number,
-            "sw_version": self._device_info.get("firmware_version"),
-        }
 
     @property
     def current_option(self) -> str:
