@@ -1,5 +1,6 @@
 """Service handlers target devices safely: local-first, duplicate-name safe."""
 import asyncio
+import json
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -303,5 +304,96 @@ def test_refresh_device_without_target_refreshes_every_coordinator(tmp_path):
         await handlers["refresh_device"](Mock(data={}))
 
         coordinator.async_request_refresh.assert_awaited_once()
+
+    asyncio.run(run())
+
+
+def test_get_device_info_reads_the_configuration_the_library_missed(tmp_path):
+    # pycloudedge <= 0.1.11 only parses result.iot, while the live
+    # /openapi/device/config reply carries a top-level iot: the event never
+    # contained the configuration.
+    async def run():
+        coordinator = make_coordinator(tmp_path)
+        coordinator.data = {
+            "sn-a": {"name": "Front Door", "device_id": "id-a", "serial_number": "sn-a"},
+        }
+        coordinator.client.get_device_info.return_value = {
+            "name": "Front Door", "device_id": "id-a", "serial_number": "sn-a",
+        }
+        coordinator.client.get_device_config.return_value = {
+            "action": "query", "code": 1001, "iot": {"154": 75}, "name": "sn-a",
+        }
+        hass = make_hass(coordinator)
+        handlers = await registered_handlers(hass)
+
+        await handlers["get_device_info"](Mock(data={"device_name": "Front Door"}))
+
+        _, event_data = hass.bus.async_fire.call_args.args
+        assert event_data["device_info"]["configuration"]["154"]["value"] == 75
+        coordinator.client.get_device_config.assert_called_once_with("sn-a")
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("include_config", [True, False])
+def test_get_device_info_reads_no_configuration_the_library_returned(tmp_path, include_config):
+    # A library that parses the reply itself (or a call without
+    # include_config) needs no second configuration read.
+    async def run():
+        coordinator = make_coordinator(tmp_path)
+        coordinator.data = {
+            "sn-a": {"name": "Front Door", "device_id": "id-a", "serial_number": "sn-a"},
+        }
+        library_info = {"name": "Front Door", "device_id": "id-a", "serial_number": "sn-a"}
+        if include_config:
+            library_info["configuration"] = {
+                "154": {"name": "BATTERY_PERCENT", "code": "154", "value": 80},
+            }
+        coordinator.client.get_device_info.return_value = library_info
+        hass = make_hass(coordinator)
+        handlers = await registered_handlers(hass)
+
+        await handlers["get_device_info"](Mock(data={
+            "device_name": "Front Door", "include_config": include_config,
+        }))
+
+        _, event_data = hass.bus.async_fire.call_args.args
+        if include_config:
+            assert event_data["device_info"]["configuration"]["154"]["value"] == 80
+        else:
+            assert "configuration" not in event_data["device_info"]
+        coordinator.client.get_device_config.assert_not_called()
+
+    asyncio.run(run())
+
+
+def test_get_device_info_fallback_never_publishes_the_alarm_jpeg(tmp_path):
+    # When the library lookup fails (e.g. two devices with the same name in
+    # pycloudedge 0.1.11), the fallback copied the coordinator's device dict,
+    # alarm JPEG bytes included: the recorder could not serialize the event,
+    # dropped it and logged the whole payload.
+    async def run():
+        coordinator = make_coordinator(tmp_path)
+        coordinator.data = {
+            "sn-a": {
+                "name": "Front Door", "device_id": "id-a", "serial_number": "sn-a",
+                "last_alarm_image": b"\xff\xd8\xff\xe0 decrypted alarm snapshot",
+                "last_alarm_time": 1700000000.0,
+            },
+        }
+        coordinator.client.get_device_info.side_effect = RuntimeError("ambiguous name")
+        coordinator.client.get_device_status.return_value = {"online": True}
+        coordinator.client.get_device_config.return_value = {"iot": {"154": 75}}
+        hass = make_hass(coordinator)
+        handlers = await registered_handlers(hass)
+
+        await handlers["get_device_info"](Mock(data={"device_id": "id-a"}))
+
+        _, event_data = hass.bus.async_fire.call_args.args
+        json.dumps(event_data)  # what the recorder has to store
+        info = event_data["device_info"]
+        assert "last_alarm_image" not in info
+        assert info["last_alarm_time"] == 1700000000.0
+        assert info["configuration"]["154"]["value"] == 75
 
     asyncio.run(run())

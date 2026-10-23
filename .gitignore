@@ -1,7 +1,6 @@
 # Home Assistant test configuration
 ha-config/
 !ha-config/.gitkeep
-docker-compose.yml
 ha-config-vanilla/
 !ha-config-vanilla/.gitkeep
 docker-compose-vanilla.yml
@@ -61,3 +60,4 @@ cloudedge_session_cache*
 
 test.py
 docs
+auto_resume_codex.py

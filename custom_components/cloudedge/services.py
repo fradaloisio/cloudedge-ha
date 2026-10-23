@@ -9,10 +9,25 @@ import voluptuous as vol
 from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.redact import async_redact_data
 
-from .const import DOMAIN
+from .const import DOMAIN, SECRET_PARAMETER_CODES
 
 _LOGGER = logging.getLogger(__name__)
+
+# P2P/live-view credentials carried by pycloudedge device dicts. They must
+# never reach logs, the event bus or the recorder.
+DEVICE_SECRET_KEYS = frozenset(
+    {
+        "host_key",
+        "host_key1",
+        "share_access_sign",
+        "p2p_init",
+        "device_p2p",
+        "relay_license_id",
+        "device_uuid",
+    }
+)
 
 # Service names
 SERVICE_SET_PARAMETER = "set_parameter"
@@ -166,7 +181,14 @@ def _read_device_info_by_identity(
     client: Any, device: dict[str, Any], include_config: bool
 ) -> dict[str, Any]:
     """Assemble device info from the exact identity, immune to duplicate names."""
-    info = dict(device)
+    # Coordinator data carries runtime-only values such as the decrypted
+    # alarm JPEG (bytes): they cannot be JSON-encoded, so the fired event
+    # would be dropped by the recorder (which then logs the whole payload).
+    info = {
+        key: value
+        for key, value in device.items()
+        if not isinstance(value, (bytes, bytearray, memoryview))
+    }
     try:
         status = client.get_device_status(device["device_id"])
         if status:
@@ -256,6 +278,14 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                 info = _read_device_info_by_identity(
                     coordinator.client, device, include_config
                 )
+            elif include_config and not info.get("configuration"):
+                # pycloudedge <= 0.1.11 only parses result.iot; the live
+                # /openapi/device/config reply carries a top-level iot.
+                serial = device.get("serial_number") or info.get("serial_number")
+                if serial:
+                    info["configuration"] = _read_configuration(
+                        coordinator.client, serial
+                    )
             return info
 
         device_info = await hass.async_add_executor_job(_read)
@@ -263,13 +293,22 @@ async def async_setup_services(hass: HomeAssistant) -> None:
         if not device_info:
             raise HomeAssistantError(f"Failed to get device info for {label}")
 
-        _LOGGER.info("Device info for %s: %s", device_name, device_info)
-        # You could emit an event here with the device info
+        safe_info = async_redact_data(device_info, DEVICE_SECRET_KEYS)
+        configuration = safe_info.get("configuration")
+        if isinstance(configuration, dict):
+            # Numeric keys are IoT codes only in the configuration; elsewhere
+            # (e.g. the bps2 profile maps) "3" is a stream profile. Redact the
+            # secret parameters (DEVICE_KEY 3, SAFE_PASSWORD 21,
+            # VIDEO_PASSWORD 217) there alone.
+            safe_info["configuration"] = async_redact_data(
+                configuration, SECRET_PARAMETER_CODES
+            )
+        _LOGGER.debug("Device info for %s: %s", device_name, safe_info)
         hass.bus.async_fire(
             f"{DOMAIN}_device_info",
             {
                 "device_name": device_name,
-                "device_info": device_info,
+                "device_info": safe_info,
             },
         )
 

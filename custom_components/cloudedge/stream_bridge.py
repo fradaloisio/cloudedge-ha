@@ -6,25 +6,34 @@ This module keeps the Home Assistant camera entity thin. The entity exposes a
 * CloudEdge P2P streaming via ``pycloudedge``
 * H.264/HEVC bitstream inspection
 * ``ffmpeg`` muxing raw video and G.711 audio into MPEG-TS
-* a tiny local TCP server that Home Assistant can open via ``tcp://...``
+* a tiny local HTTP server that streams only to clients requesting its
+  secret ``http://127.0.0.1:<port>/stream.ts?auth=<token>`` URL (Home
+  Assistant's stream worker, go2rtc) and refuses any other local process
 """
 from __future__ import annotations
 
 import errno
 import inspect
-import itertools
 import logging
 import os
 import queue
+import secrets
 import select
 import socket
 import subprocess
+import tempfile
 import threading
 import time
 from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
-from .stream_profile_policy import resolve_stream_profile_ids
+from .stream_profile_policy import (
+    resolve_auto_stream_ids,
+    resolve_stream_profile_ids,
+)
+from .stream_consumers import StreamConsumer
+from .stream_muxer import TimestampedVideoWriter
+from .stream_video_buffer import VideoBuffer
 
 if TYPE_CHECKING:
     from . import CloudEdgeCoordinator
@@ -39,29 +48,75 @@ _RECONNECT_COOLDOWN = 8.0
 _MAX_CONSECUTIVE_STREAM_FAILURES = 4
 # Home Assistant's stream worker reconnects its TCP input immediately after an
 # error.  Keep the failure state across those new local clients so they cannot
-# wake the battery camera and enable live mode forever.
-_FAILED_SESSION_COOLDOWN = 600.0
-# Stop re-feeding the held keyframe after this long without any real video, so a
-# camera that has genuinely gone offline surfaces as a stalled/errored stream
-# instead of an indefinitely frozen "live" image.
-_KEEPALIVE_MAX_HOLD = 30.0
+# wake the battery camera and enable live mode forever. The pause starts at
+# 60 s and doubles with every further attempt without video, up to 10 min;
+# the first video frame or a stream profile change resets it.
+_FAILED_SESSION_COOLDOWN = 60.0
+_FAILED_SESSION_COOLDOWN_MAX = 600.0
 _WAKE_RETRY_COOLDOWN = 15.0
 _PREWAKE_RESULT_TTL = 30.0
 _ONLINE_GRACE_WINDOW = 20.0
 _SIGNAL_STATUS_RETRY_WINDOW = 8.0
 _SIGNAL_STATUS_RETRY_POLL = 1.0
 _MAX_MPEGTS_BOOTSTRAP_BYTES = 4 * 1024 * 1024
+# A local consumer sends its HTTP request as soon as it connects (FFmpeg in
+# HA's stream worker, go2rtc). Each connection is answered on its own thread,
+# which waits this long at most for the request before it answers 404.
+_STREAM_REQUEST_TIMEOUT = 2.0
+_STREAM_REQUEST_MAX_BYTES = 4096
+# At most this many connections wait for their request at the same time; a
+# further one is closed at once, so local processes cannot pile up threads.
+# A real consumer sends its request right away and is answered at once.
+_STREAM_MAX_PENDING_REQUESTS = 8
+# Chunked, so the bridge can end the stream with the last chunk. A response
+# that only the closed connection ends reads to FFmpeg as "Stream ends
+# prematurely" (an I/O error in HA's stream worker), and Go's HTTP client
+# (go2rtc) reads chunks only from an HTTP/1.1 status line.
+_STREAM_RESPONSE_OK = (
+    b"HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\n"
+    b"Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+)
+# For an HTTP/1.0 request, which must not get chunks (RFC 9112).
+_STREAM_RESPONSE_OK_UNCHUNKED = (
+    b"HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nConnection: close\r\n\r\n"
+)
+_STREAM_RESPONSE_NOT_FOUND = (
+    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+)
 _MUX_STALL_TIMEOUT = 10.0
+# An FFmpeg that exits this soon after its start never got going (a missing
+# codec or demuxer, bad arguments): each camera IDR would start another one.
+# After _MUXER_QUICK_EXITS such exits in a row, no muxer starts until the
+# next P2P attempt.
+_MUXER_QUICK_EXIT = 5.0
+_MUXER_QUICK_EXITS = 3
+# During a video gap the pacer re-feeds the held IDR to keep HA's stream
+# worker reading: first after _KEEPALIVE_GAP without camera video (a normal
+# frame interval is at most 1/_PACER_MIN_FPS), then every _KEEPALIVE_INTERVAL.
+_KEEPALIVE_GAP = 2.0
+_KEEPALIVE_INTERVAL = 1.0
+# The hold spans a battery camera's reconnect after its ~2 min live window:
+# pycloudedge notices the stall after ~50 s, the bridge waits
+# _RECONNECT_COOLDOWN (8 s), and the next window's first video may take up to
+# the library's 30 s first-video timeout (~10 s observed). 50 + 8 + 30 = 88 s.
+# Past the hold the camera is gone, and HA's stream reports it.
+_KEEPALIVE_MAX_HOLD = 90.0
+# Shared by every bridge when the integration stops: time for each P2P session
+# to finish its own teardown before Home Assistant exits (the bridge threads
+# are daemons and would simply vanish).
+_STOP_JOIN_TIMEOUT = 5.0
 
 # Camera audio: G.711 µ-law, 8 kHz mono (8000 bytes/s), transcoded to AAC.
 # The writer feeds ffmpeg at a fixed cadence — real audio when available,
-# µ-law silence otherwise — so the audio clock never stalls the muxer.
+# µ-law silence otherwise — so ffmpeg never waits for its audio input. That
+# does not keep the output flowing: during a video gap ffmpeg holds the audio
+# back and releases it in a burst when video resumes. Only video (the re-fed
+# IDR, see _video_pacer) carries the output through a gap.
 _AUDIO_ENABLED = True
 _AUDIO_CHUNK_BYTES = 160          # 20 ms @ 8 kHz
 _AUDIO_CHUNK_SECONDS = 0.02
 _AUDIO_BUFFER_MAX_BYTES = 16000   # cap buffered audio at 2 s (bounds latency)
 _MULAW_SILENCE = 0xFF
-_AUDIO_FIFO_COUNTER = itertools.count()
 _AUTO_FALLBACK_WINDOWS = 2
 _AUTO_SUBSTREAM_FAILURES = 2
 _AUTO_MAX_SUSTAINABLE_FPS = 6.0
@@ -88,6 +143,39 @@ _STREAM_PROFILE_ALIASES = {
     "sd": STREAM_PROFILE_SUBSTREAM,
     STREAM_PROFILE_SUBSTREAM: STREAM_PROFILE_SUBSTREAM,
 }
+
+
+def _failed_session_cooldown(failures: int) -> float:
+    """Return the retry pause after `failures` attempts in a row without video."""
+    doublings = min(10, max(0, failures - _MAX_CONSECUTIVE_STREAM_FAILURES))
+    return min(_FAILED_SESSION_COOLDOWN_MAX, _FAILED_SESSION_COOLDOWN * 2 ** doublings)
+
+
+# HA's stream worker opens the source with FFmpeg, which sends the request
+# through the lowercase http_proxy variable (when it starts with http://)
+# unless the lowercase no_proxy, split at commas and spaces, names the host:
+# localhost or 127.0.0.0/8 does not cover 127.0.0.1. The worker then never
+# reaches the bridge, and the proxy receives the URL with its secret.
+# go2rtc connects directly.
+_proxy_warning_logged = False
+
+
+def _warn_if_source_is_proxied() -> None:
+    """Warn once per process if HA's stream worker would use a proxy."""
+    global _proxy_warning_logged
+    if _proxy_warning_logged or not os.environ.get("http_proxy", "").startswith("http://"):
+        return
+    no_proxy = os.environ.get("no_proxy", "").replace(",", " ").split(" ")
+    if "*" in no_proxy or "127.0.0.1" in no_proxy:
+        return
+    _proxy_warning_logged = True
+    _LOGGER.warning(
+        "The http_proxy environment variable is set and no_proxy does not list "
+        "127.0.0.1: Home Assistant's stream worker (HLS live view, live still "
+        "images, recordings) will send the cameras' local stream URL, secret "
+        "included, to the proxy and fail. Add 127.0.0.1 to the lowercase "
+        "no_proxy variable; the WebRTC live view is not affected"
+    )
 
 
 def normalize_stream_profile(profile: str) -> str:
@@ -126,71 +214,65 @@ def _convert_to_annex_b(frame_data: bytes) -> bytes:
     return b"\x00\x00\x00\x01" + frame_data
 
 
-def _annex_b_nal_headers(frame_data: bytes):
-    """Yield the first byte of each Annex B NAL unit."""
-    i = 0
-    while i < len(frame_data) - 5:
-        if frame_data[i:i + 4] == b"\x00\x00\x00\x01":
-            yield frame_data[i + 4]
-            i += 5
-            continue
-        if frame_data[i:i + 3] == b"\x00\x00\x01":
-            yield frame_data[i + 3]
-            i += 4
-            continue
-        i += 1
-
-
-def _detect_video_codec(frame_data: bytes) -> str | None:
+def _detect_video_codec(nal_units: list[bytes]) -> str | None:
     """Detect H.264 or HEVC from parameter-set NAL units."""
-    headers = list(_annex_b_nal_headers(frame_data))
-    h264_types = {header & 0x1F for header in headers}
-    if 7 in h264_types or 8 in h264_types:
-        return "h264"
-    hevc_types = {(header >> 1) & 0x3F for header in headers}
-    if hevc_types.intersection({32, 33, 34}):
+    # H.264 P slices commonly begin with 0x41, which superficially looks like
+    # HEVC type 32. HEVC headers have a second byte, layer zero and a nonzero
+    # temporal id; validate those bits before interpreting parameter sets.
+    if any(
+        len(nal) >= 2 and not nal[0] & 0x81
+        and nal[1] >> 3 == 0 and nal[1] & 7
+        and ((nal[0] >> 1) & 0x3F) in (32, 33, 34)
+        for nal in nal_units
+    ):
         return "hevc"
+    # H.264 only from its SPS. HEVC STSA_N, IDR_N_LP and EOS headers (0x08,
+    # 0x28, 0x48) share the H.264 PPS type bits; a base-layer HEVC header is
+    # even, so it can never read as an SPS (7).
+    if any((nal[0] & 0x1F) == 7 for nal in nal_units):
+        return "h264"
     return None
 
 
-def _is_video_keyframe(frame_data: bytes, codec: str) -> bool:
+def _is_video_keyframe(nal_units: list[bytes], codec: str) -> bool:
     """Return True if the access unit contains an actual keyframe slice.
 
     Parameter sets (SPS/PPS/VPS) alone do NOT count: an IDR-less access
     unit cannot be decoded, and an IDR without parameter sets is handled
     separately by prepending cached ones.
     """
-    headers = list(_annex_b_nal_headers(frame_data))
     if codec == "h264":
-        return any((header & 0x1F) == 5 for header in headers)
-    return any(((header >> 1) & 0x3F) in {19, 20} for header in headers)
+        return any((nal[0] & 0x1F) == 5 for nal in nal_units)
+    return any(((nal[0] >> 1) & 0x3F) in (19, 20) for nal in nal_units)
 
 
-def _iter_nal_units(frame_data: bytes):
-    """Yield each Annex B NAL unit payload (start code stripped)."""
-    positions = []
-    i = 0
-    n = len(frame_data)
-    while i + 3 <= n:
-        if frame_data[i:i + 3] == b"\x00\x00\x01":
-            positions.append(i + 3)
-            i += 3
+def _split_nal_units(frame_data: bytes) -> list[bytes]:
+    """Return each Annex B NAL unit payload (start code stripped).
+
+    bytes.find locates the start codes, so splitting a large I-frame costs
+    a few calls per NAL unit rather than a Python step per byte.
+    """
+    nal_units = []
+    start = frame_data.find(b"\x00\x00\x01")
+    while start >= 0:
+        start += 3
+        end = frame_data.find(b"\x00\x00\x01", start)
+        if end < 0:
+            payload = frame_data[start:]
         else:
-            i += 1
-    for idx, start in enumerate(positions):
-        end = positions[idx + 1] - 3 if idx + 1 < len(positions) else n
-        # Drop the leading zero that belongs to the next 4-byte start code
-        while end > start and idx + 1 < len(positions) and frame_data[end - 1] == 0:
-            end -= 1
-        payload = frame_data[start:end]
+            # Zeros before a start code belong to it (the leading zero of a
+            # 4-byte start code, trailing_zero_8bits).
+            payload = frame_data[start:end].rstrip(b"\x00")
         if payload:
-            yield payload
+            nal_units.append(payload)
+        start = end
+    return nal_units
 
 
 def _extract_parameter_sets(frame_data: bytes, codec: str) -> bytes:
     """Return the SPS/PPS (H.264) or VPS/SPS/PPS (HEVC) NAL units."""
     out = bytearray()
-    for nal in _iter_nal_units(frame_data):
+    for nal in _split_nal_units(frame_data):
         if codec == "h264":
             is_ps = (nal[0] & 0x1F) in (7, 8)
         else:
@@ -201,7 +283,7 @@ def _extract_parameter_sets(frame_data: bytes, codec: str) -> bytes:
 
 
 class CloudEdgeStreamBridge:
-    """Bridge one CloudEdge camera to a local MPEG-TS TCP endpoint."""
+    """Bridge one CloudEdge camera to a local MPEG-TS HTTP endpoint."""
 
     def __init__(self, coordinator: CloudEdgeCoordinator, serial_number: str) -> None:
         self._coordinator = coordinator
@@ -213,20 +295,30 @@ class CloudEdgeStreamBridge:
         # their generation and exit when it changes, so a thread blocked in
         # a long wait during stop() cannot resurrect into the next session.
         self._session_generation = 0
+        self._attempt_generation = 0
         self._got_keyframe = False
-        self._pending_param_sets: bytes | None = None
+        self._muxer_quick_exits = 0
 
         self._stream_port = 0
+        # Only a request for this target gets the stream: any local process
+        # can reach the port. It lasts as long as the bridge, so the source
+        # that HA's Stream and go2rtc keep stays valid across reconnects.
+        self._stream_target = f"/stream.ts?auth={secrets.token_urlsafe(32)}"
         self._stream_server: socket.socket | None = None
         self._stream_accept_thread: threading.Thread | None = None
         self._stream_clients: list[socket.socket] = []
+        self._stream_consumers: dict[socket.socket, StreamConsumer] = {}
         self._stream_clients_lock = threading.Lock()
         self._mpegts_bootstrap = bytearray()
         self._bootstrap_reset = threading.Event()
 
         self._ffmpeg_proc: subprocess.Popen | None = None
+        self._video_writer: TimestampedVideoWriter | None = None
         self._ffmpeg_lock = threading.Lock()
         self._video_codec: str | None = None
+        self._muxer_parameter_sets: bytes | None = None
+        self._muxer_first_keyframe = b""
+        self._mux_epoch: float | None = None
         self._ffmpeg_reader_thread: threading.Thread | None = None
         self._ffmpeg_stderr_thread: threading.Thread | None = None
         self._video_pacer_thread: threading.Thread | None = None
@@ -235,8 +327,7 @@ class CloudEdgeStreamBridge:
         self._audio_fifo_path: str | None = None
         self._audio_buffer = bytearray()
         self._audio_buffer_lock = threading.Lock()
-        self._latest_keyframe: bytes | None = None
-        self._video_queue: queue.Queue[tuple[bytes, bool]] = queue.Queue(maxsize=120)
+        self._video_queue = VideoBuffer()
 
         self._worker_thread: threading.Thread | None = None
         self._idle_watch_thread: threading.Thread | None = None
@@ -244,16 +335,21 @@ class CloudEdgeStreamBridge:
 
         self._stream_profile = STREAM_PROFILE_AUTO
         self._active_video_id: int | None = None
+        # Auto's start ID and its degraded fallback (equal when the camera
+        # has no strictly lighter profile than its default).
         self._main_video_id = 0
         self._substream_video_id = 1
-        self._available_video_ids: tuple[int, ...] = (0, 1)
+        # Explicit HD/SD selections (largest / smallest advertised profile),
+        # unknown until an attempt resolves the camera's profiles.
+        self._hd_video_id: int | None = None
+        self._sd_video_id: int | None = None
+        self._available_video_ids: tuple[int, ...] = ()
         self._profile_changed = threading.Event()
         self._auto_degraded_windows = 0
         self._auto_substream_failures = 0
 
         self._metrics_lock = threading.Lock()
         self._stream_state = "idle"
-        self._live_switch_enabled = False
         self._reconnect_count = 0
         self._wake_count = 0
         self._last_session_frames = 0
@@ -262,16 +358,24 @@ class CloudEdgeStreamBridge:
         self._last_session_fps = 0.0
         self._last_max_frame_gap = 0.0
         self._pacer_fps = _PACER_MAX_FPS
+        self._video_dropped_frames = 0
         self._audio_frames = 0
         self._audio_bytes = 0
         self._last_audio_at = 0.0
         self._last_error: str | None = None
         self._failure_cooldown_until = 0.0
         self._consecutive_stream_failures = 0
+        # Attempt generation current when the bridge itself last stopped an
+        # attempt (viewer gone / profile change). Such an attempt says
+        # nothing about the camera. A second stop while the attempt is still
+        # closing records a later generation, hence the >= in the worker.
+        self._bridge_stopped_attempt = 0
 
         self._last_request_time = 0.0
         self._last_client_time = 0.0
+        self._source_restart_until = 0.0
         self._last_video_write = 0.0
+        self._video_write_started = 0.0
         self._last_real_video = 0.0
         self._last_stop_reason = "idle"
         self._last_wake_attempt = 0.0
@@ -308,17 +412,20 @@ class CloudEdgeStreamBridge:
                 dead.append(client)
         for client in dead:
             self._stream_clients.remove(client)
-            try:
+            consumer = self._stream_consumers.pop(client, None)
+            if consumer is not None:
+                consumer.close()
+            else:
                 client.close()
-            except OSError:
-                pass
 
     @property
     def stream_source(self) -> str | None:
-        """Return the local MPEG-TS source URL."""
+        """Return the local MPEG-TS source URL, secret included."""
         if not self._stream_port:
             return None
-        return f"tcp://127.0.0.1:{self._stream_port}"
+        # As the auth query parameter, the secret is masked wherever Home
+        # Assistant logs the URL (stream worker errors, go2rtc output).
+        return f"http://127.0.0.1:{self._stream_port}{self._stream_target}"
 
     @property
     def stream_profile(self) -> str:
@@ -328,22 +435,25 @@ class CloudEdgeStreamBridge:
     def set_stream_profile(self, profile: str) -> None:
         """Select the stream profile and restart only the active P2P attempt."""
         profile = normalize_stream_profile(profile)
-        if profile == self._stream_profile:
-            return
+        with self._lock:
+            if profile == self._stream_profile:
+                return
 
-        self._stream_profile = profile
-        self._active_video_id = None
-        self._auto_degraded_windows = 0
-        self._auto_substream_failures = 0
-        self._consecutive_stream_failures = 0
-        self._failure_cooldown_until = 0.0
-        self._profile_changed.set()
-        streamer = self._p2p_streamer
-        if streamer is not None:
-            try:
-                streamer.request_stop()
-            except Exception:
-                pass
+            self._stream_profile = profile
+            self._active_video_id = None
+            self._auto_degraded_windows = 0
+            self._auto_substream_failures = 0
+            self._consecutive_stream_failures = 0
+            self._failure_cooldown_until = 0.0
+            self._profile_changed.set()
+            self._bridge_stopped_attempt = self._attempt_generation
+            self._attempt_generation += 1
+            streamer = self._p2p_streamer
+            if streamer is not None:
+                try:
+                    streamer.request_stop()
+                except Exception:
+                    pass
         self._coordinator.notify_stream_state_changed()
 
     def diagnostics(self) -> dict[str, object]:
@@ -352,23 +462,30 @@ class CloudEdgeStreamBridge:
         openapi_base = getattr(client, "OPENAPI_BASE_URL", "") if client else ""
         openapi_host = urlparse(openapi_base).hostname or None
         with self._metrics_lock:
+            cooldown = max(0.0, self._failure_cooldown_until - time.monotonic())
+            state = self._stream_state
+            if state == "retry_cooldown" and not cooldown:
+                state = "idle"  # the pause expired or a profile change reset it
+            if self._active_video_id is None:
+                active_profile = None  # no stream opened for this profile yet
+            elif (
+                self._active_video_id == self._sd_video_id
+                and self._sd_video_id != self._hd_video_id
+            ):
+                active_profile = STREAM_PROFILE_SUBSTREAM
+            else:
+                active_profile = STREAM_PROFILE_MAIN
             return {
                 "stream_profile": self._stream_profile,
-                "stream_profile_active": (
-                    STREAM_PROFILE_SUBSTREAM
-                    if self._active_video_id == self._substream_video_id
-                    and self._substream_video_id != self._main_video_id
-                    else STREAM_PROFILE_MAIN
-                ),
+                "stream_profile_active": active_profile,
                 "stream_video_id": self._active_video_id,
-                "stream_main_video_id": self._main_video_id,
-                "stream_substream_video_id": self._substream_video_id,
+                "stream_main_video_id": self._hd_video_id,
+                "stream_substream_video_id": self._sd_video_id,
                 "stream_available_video_ids": list(self._available_video_ids),
-                "stream_state": self._stream_state,
+                "stream_state": state,
                 "stream_clients": self.client_count,
                 "stream_codec": self._video_codec,
                 "stream_openapi_host": openapi_host,
-                "stream_live_switch": self._live_switch_enabled,
                 "stream_reconnects": self._reconnect_count,
                 "stream_wakes": self._wake_count,
                 "stream_last_frames": self._last_session_frames,
@@ -377,6 +494,9 @@ class CloudEdgeStreamBridge:
                 "stream_last_fps": round(self._last_session_fps, 2),
                 "stream_last_max_gap": round(self._last_max_frame_gap, 2),
                 "stream_pacer_fps": round(self._pacer_fps, 2),
+                # VideoBuffer admission refusals only: frames discarded with
+                # a retired GOP are not counted.
+                "stream_dropped_frames": self._video_dropped_frames,
                 "stream_audio_codec": "pcm_mulaw/8000",
                 "stream_audio_frames": self._audio_frames,
                 "stream_audio_bytes": self._audio_bytes,
@@ -385,10 +505,7 @@ class CloudEdgeStreamBridge:
                     and time.monotonic() - self._last_audio_at < 5.0
                 ),
                 "stream_last_error": self._last_error,
-                "stream_retry_cooldown": round(
-                    max(0.0, self._failure_cooldown_until - time.monotonic()),
-                    1,
-                ),
+                "stream_retry_cooldown": round(cooldown, 1),
             }
 
     def ensure_started(self) -> str | None:
@@ -456,10 +573,17 @@ class CloudEdgeStreamBridge:
             self._prewake_completed_at = 0.0
         return result
 
-    def stop(self, reason: str = "stopped") -> None:
-        """Stop the bridge and free all resources."""
+    def stop(self, reason: str = "stopped") -> threading.Thread | None:
+        """Stop the bridge and free all resources.
+
+        Return the stopped session's worker thread: its P2P session may still
+        be closing when this returns. _stop_locked() forgets the thread, so it
+        is captured here under the same lock.
+        """
         with self._lock:
+            worker = self._worker_thread
             self._stop_locked(reason)
+        return worker
 
     def _stop_locked(self, reason: str) -> None:
         if not (
@@ -473,6 +597,8 @@ class CloudEdgeStreamBridge:
 
         self._last_stop_reason = reason
         self._running = False
+        self._session_generation += 1
+        self._attempt_generation += 1
         with self._metrics_lock:
             self._stream_state = reason
         close_listener = reason in {"manager_stop", "device_removed", "stopped"}
@@ -489,15 +615,7 @@ class CloudEdgeStreamBridge:
                 pass
             self._stream_server = None
 
-        with self._stream_clients_lock:
-            for client in self._stream_clients:
-                try:
-                    client.close()
-                except OSError:
-                    pass
-            self._stream_clients.clear()
-            self._mpegts_bootstrap.clear()
-            self._bootstrap_reset.clear()
+        self._close_stream_consumers()
 
         # Teardown order matters: terminate the process BEFORE touching its
         # pipes. Closing stdin first would flush a BufferedWriter into a
@@ -508,39 +626,12 @@ class CloudEdgeStreamBridge:
         # callback thread cannot spawn a fresh muxer in between (it checks
         # _running, already False, under the same lock).
         with self._ffmpeg_lock:
-            proc = self._ffmpeg_proc
-            self._ffmpeg_proc = None
-            if proc is not None:
-                try:
-                    proc.terminate()
-                except Exception:
-                    pass
-                try:
-                    proc.wait(timeout=5)
-                except Exception:
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
-                    try:
-                        proc.wait(timeout=2)
-                    except Exception:
-                        pass
-                # Process is gone: closing the pipes can no longer block on
-                # a full buffer, and the pacer/audio writer either exited
-                # on EPIPE or will on the next write.
-                for stream in (proc.stdin, proc.stdout, proc.stderr):
-                    try:
-                        if stream is not None:
-                            stream.close()
-                    except Exception:
-                        pass
+            self._retire_muxer_locked()
+            self._video_codec = None
+            self._muxer_parameter_sets = None
+            self._mux_epoch = None
 
-        while not self._video_queue.empty():
-            try:
-                self._video_queue.get_nowait()
-            except queue.Empty:
-                break
+        self._video_queue.clear()
         self._cleanup_audio_fifo(self._audio_fifo_path)
         self._audio_fifo_path = None
         with self._audio_buffer_lock:
@@ -555,7 +646,6 @@ class CloudEdgeStreamBridge:
         self._video_pacer_thread = None
         self._video_keepalive_thread = None
         self._audio_writer_thread = None
-        self._latest_keyframe = None
         self._coordinator.notify_stream_state_changed()
 
     def _start_stream_server(self) -> bool:
@@ -574,6 +664,7 @@ class CloudEdgeStreamBridge:
                 daemon=True,
             )
             self._stream_accept_thread.start()
+            _warn_if_source_is_proxied()
             return True
         except OSError as err:
             _LOGGER.error("Failed to start local stream server for %s: %s", self._serial_number, err)
@@ -582,6 +673,10 @@ class CloudEdgeStreamBridge:
             return False
 
     def _accept_stream_clients(self) -> None:
+        # Each connection is answered on its own short-lived thread: a local
+        # process that connects and stays silent cannot hold up HA's stream
+        # worker or go2rtc until its request times out.
+        pending = threading.BoundedSemaphore(_STREAM_MAX_PENDING_REQUESTS)
         while self._running or self._stream_server is not None:
             server = self._stream_server
             if server is None:
@@ -594,42 +689,110 @@ class CloudEdgeStreamBridge:
                 # Listening socket closed/broken: end the accept loop.
                 return
 
-            # Per-client failures must never kill the accept loop: a client
-            # resetting mid-bootstrap would otherwise leave the port
-            # listening but unserviced for every future connection.
+            if not pending.acquire(blocking=False):
+                _LOGGER.debug(
+                    "Too many unanswered local stream requests for %s; closed %s",
+                    self._serial_number, addr,
+                )
+                client.close()
+                continue
+            # Per-client failures must never kill the accept loop: the port
+            # would stay open but unserviced for every future connection.
+            try:
+                threading.Thread(
+                    target=self._serve_stream_client,
+                    args=(client, addr, pending),
+                    name=f"cloudedge_stream_request_{self._serial_number}",
+                    daemon=True,
+                ).start()
+            except RuntimeError as err:
+                pending.release()
+                _LOGGER.debug(
+                    "Could not answer a stream request for %s: %s", self._serial_number, err
+                )
+                client.close()
+
+    def _serve_stream_client(
+        self,
+        client: socket.socket,
+        addr: tuple[str, int],
+        pending: threading.BoundedSemaphore,
+    ) -> None:
+        """Answer one local connection and register it if it may stream."""
+        try:
             try:
                 client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                client.settimeout(5)
-                with self._stream_clients_lock:
-                    bootstrap = bytes(self._mpegts_bootstrap)
-                # Transmit outside the clients lock: a slow bootstrap
-                # handshake must not block diagnostics or broadcasts. The
-                # socket is not yet in the client list, so no other sender
-                # can interleave with this sendall.
-                if bootstrap:
-                    client.sendall(bootstrap)
-                with self._stream_clients_lock:
-                    self._stream_clients.append(client)
-            except OSError as err:
+                chunked = self._answer_stream_request(client)
+            finally:
+                pending.release()
+            if chunked is None:
                 _LOGGER.debug(
-                    "Stream client handshake failed for %s: %s", self._serial_number, err
+                    "Refused a local stream request for %s from %s",
+                    self._serial_number, addr,
                 )
-                try:
-                    client.close()
-                except OSError:
-                    pass
-                continue
+                client.close()
+                return
+            if not self._register_stream_client(client, chunked=chunked):
+                return
+        except OSError as err:
+            _LOGGER.debug(
+                "Stream client handshake failed for %s: %s", self._serial_number, err
+            )
+            try:
+                client.close()
+            except OSError:
+                pass
+            return
 
-            self._last_client_time = time.monotonic()
-            _LOGGER.debug("Stream client connected for %s from %s", self._serial_number, addr)
-            if not self._ensure_pipeline_started():
-                with self._stream_clients_lock:
-                    if client in self._stream_clients:
-                        self._stream_clients.remove(client)
-                try:
-                    client.close()
-                except OSError:
-                    pass
+        self._last_client_time = time.monotonic()
+        _LOGGER.debug("Stream client connected for %s from %s", self._serial_number, addr)
+        if not self._ensure_pipeline_started():
+            self._stream_client_closed(client)
+
+    def _answer_stream_request(self, client: socket.socket) -> bool | None:
+        """Answer a local client's HTTP request.
+
+        Only a GET for this bridge's secret target receives the 200 header,
+        which the MPEG-TS stream then follows. Any other client, or one whose
+        request is not complete within _STREAM_REQUEST_TIMEOUT, gets a 404
+        before it is registered, so it can neither wake nor watch the camera.
+
+        Return None for a refused client, otherwise whether its stream is
+        sent in chunks: every client but an HTTP/1.0 one.
+        """
+        deadline = time.monotonic() + _STREAM_REQUEST_TIMEOUT
+        request = b""
+        # Read the whole header block: a byte left unread would keep the
+        # socket readable after the client's EOF, and
+        # _prune_disconnected_clients_locked would never drop it.
+        while b"\r\n\r\n" not in request and len(request) <= _STREAM_REQUEST_MAX_BYTES:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            client.settimeout(remaining)
+            try:
+                chunk = client.recv(4096)
+            except TimeoutError:
+                break
+            if not chunk:
+                break
+            request += chunk
+        method, _, rest = request.partition(b"\r\n")[0].partition(b" ")
+        target, _, version = rest.partition(b" ")
+        # The last wait may have left an expired timeout on the socket.
+        client.settimeout(_STREAM_REQUEST_TIMEOUT)
+        if (
+            b"\r\n\r\n" in request
+            and method == b"GET"
+            and secrets.compare_digest(target, self._stream_target.encode())
+        ):
+            chunked = version != b"HTTP/1.0"
+            client.sendall(
+                _STREAM_RESPONSE_OK if chunked else _STREAM_RESPONSE_OK_UNCHUNKED
+            )
+            return chunked
+        client.sendall(_STREAM_RESPONSE_NOT_FOUND)
+        return None
 
     def _ensure_pipeline_started(self) -> bool:
         """Start ffmpeg and the P2P worker on the first real stream consumer."""
@@ -655,16 +818,16 @@ class CloudEdgeStreamBridge:
                 return False
 
             # HA may ask for stream_source() speculatively. Wake only after its
-            # stream worker has opened the local TCP source, which proves there
-            # is a real consumer for this camera.
+            # stream worker (or go2rtc) has opened the local source with its
+            # secret URL, which proves there is a real consumer for this camera.
             self._kick_prewake()
             self._running = True
             self._session_generation += 1
             gen = self._session_generation
             self._got_keyframe = False
-            self._pending_param_sets = None
             with self._metrics_lock:
                 self._stream_state = "starting"
+                self._video_dropped_frames = 0
                 self._audio_frames = 0
                 self._audio_bytes = 0
                 self._last_audio_at = 0.0
@@ -688,43 +851,155 @@ class CloudEdgeStreamBridge:
         return True
 
     def _broadcast_stream(self, data: bytes) -> None:
-        # Snapshot under the lock, transmit outside it: a stalled client
-        # (full TCP buffer) blocks only its own sendall, never diagnostics
-        # (client_count) or anything else reading connection state.
         with self._stream_clients_lock:
-            clients = list(self._stream_clients)
-        dead = []
-        for client in clients:
-            try:
-                client.sendall(data)
-            except (BrokenPipeError, ConnectionError, OSError):
-                dead.append(client)
-        if not dead:
-            if clients:
-                self._last_client_time = time.monotonic()
-            return
-        with self._stream_clients_lock:
-            for client in dead:
-                # Guard against a concurrent prune/stop that already
-                # removed (and closed) this socket.
+            self._broadcast_stream_locked(data)
+
+    def _broadcast_stream_locked(self, data: bytes) -> None:
+        # Admission is nonblocking; each consumer owns its socket writer and
+        # latency budget. A slow consumer cannot stall FFmpeg or another one.
+        for client, consumer in list(self._stream_consumers.items()):
+            if not consumer.enqueue(data):
+                self._stream_consumers.pop(client, None)
                 if client in self._stream_clients:
                     self._stream_clients.remove(client)
+        if self._stream_clients:
+            self._last_client_time = time.monotonic()
+
+    def _register_stream_client(
+        self, client: socket.socket, *, chunked: bool = False
+    ) -> bool:
+        consumer = StreamConsumer(client, self._stream_client_closed, chunked=chunked)
+        with self._stream_clients_lock:
+            # Registration and the bootstrap snapshot share the output-reader
+            # lock. Every subsequent chunk follows bootstrap exactly once,
+            # even if its writer has not started yet.
+            self._stream_clients.append(client)
+            self._stream_consumers[client] = consumer
+            accepted = consumer.enqueue(bytes(self._mpegts_bootstrap))
+        consumer.start()
+        if not accepted:
+            self._stream_client_closed(client)
+        return accepted
+
+    def _stream_client_closed(self, client: socket.socket) -> None:
+        with self._stream_clients_lock:
+            consumer = self._stream_consumers.pop(client, None)
+            if client in self._stream_clients:
+                self._stream_clients.remove(client)
+            if consumer is not None:
+                consumer.close()
+
+    def _close_stream_consumers(self) -> None:
+        """End the current source without acquiring the muxer lock.
+
+        Every consumer ends its response on its own writer thread (see
+        StreamConsumer.finish), so HA's stream worker reads the end of the
+        stream instead of a broken connection, and this never waits for a
+        socket: it also runs on HA's event loop.
+        """
+        with self._stream_clients_lock:
+            for consumer in self._stream_consumers.values():
+                consumer.finish()
+            for client in self._stream_clients:
+                if client in self._stream_consumers:
+                    continue  # its writer closes it once the response ends
                 try:
                     client.close()
                 except OSError:
                     pass
-            if self._stream_clients:
-                self._last_client_time = time.monotonic()
+            self._stream_clients.clear()
+            self._stream_consumers.clear()
+            self._mpegts_bootstrap.clear()
+            self._bootstrap_reset.clear()
 
-    def _start_ffmpeg_muxer(self, video_codec: str) -> bool:
+    def _retire_muxer_locked(self) -> None:
+        proc = self._ffmpeg_proc
+        self._ffmpeg_proc = None
+        writer = self._video_writer
+        self._video_writer = None
+        if proc is None:
+            return
+        # The retired MPEG-TS output is discarded, so a graceful exit buys
+        # nothing. SIGTERM cannot finish while FFmpeg's NUT demuxer is blocked
+        # reading an idle stdin (the pacer cannot write under this lock), so
+        # terminate() would always cost the full wait plus SIGKILL.
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=2)
+        except Exception:
+            pass
+        if writer is not None:
+            try:
+                writer.close()
+            except Exception:
+                pass
+        for stream in (proc.stdin, proc.stdout, proc.stderr):
+            try:
+                if stream is not None:
+                    stream.close()
+            except Exception:
+                pass
+        self._video_queue.clear()
+        with self._audio_buffer_lock:
+            self._audio_buffer.clear()
+        self._last_video_write = 0.0
+        self._video_write_started = 0.0
+
+    def _start_ffmpeg_muxer(
+        self, video_codec: str, *, parameter_sets: bytes = b"", first_keyframe: bytes = b"",
+        generation: int | None = None, attempt_generation: int | None = None,
+    ) -> bool:
         with self._ffmpeg_lock:
-            if not self._running:
+            def active() -> bool:
+                return self._running and (
+                    generation is None or generation == self._session_generation
+                ) and (
+                    attempt_generation is None or attempt_generation == self._attempt_generation
+                )
+            if not active():
                 # Bridge stopped between the video callback firing and this
                 # call: do not spawn an ffmpeg nobody will tear down.
                 return False
-            if self._ffmpeg_proc is not None and self._ffmpeg_proc.poll() is None:
-                return self._video_codec == video_codec
+            format_changed = self._video_codec is not None and (
+                self._video_codec != video_codec
+                or self._muxer_parameter_sets != parameter_sets
+            )
+            if format_changed:
+                # Stop publishing the old format before ending its source.
+                # A consumer can reconnect as soon as it sees EOF, while
+                # this thread is still waiting for HA's notification. The
+                # retired reader must not refill bootstrap or send old bytes
+                # to that new connection.
+                self._retire_muxer_locked()
+                # HA must request its fast restart before EOF; otherwise it
+                # enters the stream provider's increasing reconnect backoff.
+                told = self._coordinator.notify_stream_source_changed(
+                    self._serial_number, self._close_stream_consumers
+                )
+                if not active():
+                    return False
+                if told:
+                    self._source_restart_until = time.monotonic() + 5.0
+                else:
+                    # HA's loop did not answer in time. Asking again at every
+                    # IDR of the new format blocked this P2P thread, bridge
+                    # and muxer locks held, for the whole wait each time.
+                    # Switch now: the old source ends with EOF and HA's stream
+                    # reconnects through its retry backoff, which the short
+                    # reconnect window would not cover.
+                    self._close_stream_consumers()
+            if self._ffmpeg_proc is not None:
+                if self._ffmpeg_proc.poll() is None and not format_changed:
+                    return True
+                self._retire_muxer_locked()
             self._video_codec = video_codec
+            self._muxer_parameter_sets = parameter_sets
+            self._muxer_first_keyframe = first_keyframe
+            if self._mux_epoch is None:
+                self._mux_epoch = time.monotonic()
             return self._start_ffmpeg_muxer_locked(video_codec)
 
     def _start_ffmpeg_muxer_locked(self, video_codec: str) -> bool:
@@ -739,17 +1014,18 @@ class CloudEdgeStreamBridge:
             "-probesize",
             "32768",
             "-analyzeduration",
-            "0",
-            # Stamp every access unit with its real arrival time so media-time
-            # tracks wall-clock. The CloudEdge source is a steady but low frame
-            # rate (~3-5 fps); forcing a synthetic 15 fps compressed the media
-            # clock and made HLS players outrun the producer and stall.
-            "-use_wallclock_as_timestamps",
             "1",
+            "-fpsprobesize",
+            "0",
+            # Timestamped compressed packets retain access-unit boundaries
+            # and the paced clock. A raw video demuxer probes for a frame rate
+            # and timestamps buffered reads together, adding delay and bursts.
+            "-use_wallclock_as_timestamps",
+            "0",
             "-thread_queue_size",
             "512",
             "-f",
-            video_codec,
+            "nut",
             "-i",
             "pipe:0",
         ]
@@ -760,8 +1036,8 @@ class CloudEdgeStreamBridge:
             # the muxed AAC carries absolute-clock PTS and PyAV cannot infer
             # the stream profile — Home Assistant's stream worker then drops
             # the audio track ("profile is None"). The muxer only starts at
-            # the first video keyframe, so both inputs begin together and A/V
-            # stay aligned without a shared clock.
+            # the first video keyframe. The writer's clock starts with the
+            # muxer, including the time spent waiting for this FIFO to open.
             cmd += [
                 "-thread_queue_size",
                 "512",
@@ -800,6 +1076,8 @@ class CloudEdgeStreamBridge:
             "mpegts",
             "-mpegts_flags",
             "+resend_headers+pat_pmt_at_frames",
+            "-output_ts_offset",
+            f"{max(0.0, time.monotonic() - (self._mux_epoch or time.monotonic())):.6f}",
             "pipe:1",
         ]
 
@@ -810,6 +1088,17 @@ class CloudEdgeStreamBridge:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
             )
+            self._video_writer = TimestampedVideoWriter(
+                self._ffmpeg_proc.stdin,
+                video_codec,
+                self._muxer_first_keyframe,
+                keyframe_detector=lambda data: _is_video_keyframe(
+                    _split_nal_units(data), video_codec
+                ),
+            )
+            # A retired pacer may still be waiting in get(). Give every muxer
+            # its own queue so it cannot steal the new process's first IDR.
+            self._video_queue = VideoBuffer()
             with self._stream_clients_lock:
                 self._mpegts_bootstrap.clear()
         except FileNotFoundError:
@@ -819,7 +1108,7 @@ class CloudEdgeStreamBridge:
             return False
         except Exception as err:
             _LOGGER.error("Failed to start ffmpeg for %s: %s", self._serial_number, err)
-            self._ffmpeg_proc = None
+            self._retire_muxer_locked()
             self._cleanup_audio_fifo(audio_fifo)
             return False
         self._audio_fifo_path = audio_fifo
@@ -845,7 +1134,7 @@ class CloudEdgeStreamBridge:
         self._ffmpeg_stderr_thread.start()
         self._video_pacer_thread = threading.Thread(
             target=self._video_pacer,
-            args=(proc,),
+            args=(proc, self._video_writer, self._video_queue),
             name=f"cloudedge_video_pacer_{self._serial_number}",
             daemon=True,
         )
@@ -868,18 +1157,27 @@ class CloudEdgeStreamBridge:
         return True
 
     def _prepare_audio_fifo(self) -> str | None:
-        """Create the named FIFO used as ffmpeg's audio input."""
-        path = (
-            f"/tmp/cloudedge_audio_{self._serial_number}_"
-            f"{next(_AUDIO_FIFO_COUNTER)}.fifo"
-        )
+        """Create the named FIFO used as ffmpeg's audio input.
+
+        Each muxer gets its own private (0700) directory. A fixed name in /tmp
+        collided with the FIFO left behind when Home Assistant was stopped
+        mid-stream ('File exists': the next muxer ran without audio), and was
+        open to other local users.
+        """
+        directory = None
         try:
-            os.mkfifo(path)
+            directory = tempfile.mkdtemp(prefix="cloudedge-audio-")
+            path = os.path.join(directory, "audio.fifo")
+            os.mkfifo(path, 0o600)
         except OSError as err:
+            if directory is not None:
+                try:
+                    os.rmdir(directory)
+                except OSError:
+                    pass
             _LOGGER.warning(
-                "Audio disabled for %s: cannot create fifo %s: %s",
+                "Audio disabled for %s: cannot create fifo: %s",
                 self._serial_number,
-                path,
                 err,
             )
             return None
@@ -887,12 +1185,14 @@ class CloudEdgeStreamBridge:
 
     @staticmethod
     def _cleanup_audio_fifo(path: str | None) -> None:
+        """Remove a FIFO and its private directory; safe to repeat."""
         if not path:
             return
-        try:
-            os.unlink(path)
-        except OSError:
-            pass
+        for remove, target in ((os.unlink, path), (os.rmdir, os.path.dirname(path))):
+            try:
+                remove(target)
+            except OSError:
+                pass
 
     def _audio_writer(self, proc: subprocess.Popen, fifo_path: str) -> None:
         """Feed ffmpeg's audio FIFO at a fixed 8 kB/s cadence.
@@ -901,6 +1201,12 @@ class CloudEdgeStreamBridge:
         the audio clock keeps running during live-window gaps and the muxer
         never stalls waiting for the audio input.
         """
+        # Video can already be arriving while ffmpeg probes its first input.
+        # Start the sample clock now, before the FIFO is opened, so delayed
+        # opening does not permanently put audio (and the TS interleaver)
+        # behind video. Catch-up uses the same bounded 20 ms chunks and keeps
+        # any real samples accumulated in the existing audio buffer.
+        next_write = time.monotonic()
         fd = None
         try:
             # ffmpeg opens the FIFO's read side while parsing its inputs;
@@ -922,7 +1228,6 @@ class CloudEdgeStreamBridge:
             os.set_blocking(fd, True)
 
             silence = bytes([_MULAW_SILENCE]) * _AUDIO_CHUNK_BYTES
-            next_write = time.monotonic()
             while proc.poll() is None:
                 with self._audio_buffer_lock:
                     if self._audio_buffer:
@@ -940,9 +1245,6 @@ class CloudEdgeStreamBridge:
                 delay = next_write - time.monotonic()
                 if delay > 0:
                     time.sleep(delay)
-                else:
-                    # Fell behind (e.g. blocked write); restart the cadence.
-                    next_write = time.monotonic()
         finally:
             if fd is not None:
                 try:
@@ -960,6 +1262,8 @@ class CloudEdgeStreamBridge:
                 if not data:
                     return
                 with self._stream_clients_lock:
+                    if self._ffmpeg_proc is not proc:
+                        return
                     if self._bootstrap_reset.is_set():
                         self._mpegts_bootstrap.clear()
                         self._bootstrap_reset.clear()
@@ -968,7 +1272,7 @@ class CloudEdgeStreamBridge:
                         <= _MAX_MPEGTS_BOOTSTRAP_BYTES
                     ):
                         self._mpegts_bootstrap.extend(data)
-                self._broadcast_stream(data)
+                    self._broadcast_stream_locked(data)
         except Exception as err:
             _LOGGER.debug("ffmpeg stdout reader stopped for %s: %s", self._serial_number, err)
 
@@ -983,50 +1287,149 @@ class CloudEdgeStreamBridge:
         except Exception:
             return
 
-    def _video_pacer(self, proc: subprocess.Popen) -> None:
+    def _video_pacer(
+        self, proc: subprocess.Popen, writer: TimestampedVideoWriter,
+        video_queue: VideoBuffer,
+    ) -> None:
         # KCP can deliver several seconds of video in a short burst after a gap.
         # Writing that burst immediately makes ffmpeg assign compressed wall-clock
         # timestamps, so HA freezes and then fast-forwards. Space writes using the
-        # measured source cadence and never accelerate to catch up.
+        # measured source cadence; drain a backlog proportionally faster, never
+        # in one burst.
+        #
+        # During a video gap FFmpeg emits nothing, audio included: HA's stream
+        # worker fails after 30 s without data and its reconnect then reports a
+        # timestamp discontinuity. Re-feed the last real IDR written here,
+        # never a predicted frame: it is a complete decoder entry point and its
+        # wall-clock timestamp keeps the output continuous. Admission closes
+        # first, so frames predicted from the pictures before the gap wait for
+        # the camera's next IDR. Re-fed frames bypass on_video and VideoBuffer:
+        # frame, gap and drop counts and _last_real_video see only the camera.
         next_write_at = 0.0
+        held_keyframe: bytes | None = None
+        refeed_at = 0.0
         while True:
             if proc.poll() is not None or proc.stdin is None:
                 return
+            timeout = 0.5
+            if held_keyframe is not None:
+                delay = self._keyframe_refeed_delay(refeed_at)
+                if delay is not None:
+                    timeout = min(timeout, delay)
             try:
-                data, reset_bootstrap = self._video_queue.get(timeout=0.5)
+                data, keyframe = video_queue.get(timeout=timeout)
             except queue.Empty:
                 if not self._running:
                     return
+                if (
+                    held_keyframe is None
+                    or self._keyframe_refeed_delay(refeed_at) != 0.0
+                ):
+                    continue
+                try:
+                    with self._ffmpeg_lock:
+                        if self._ffmpeg_proc is not proc or not self._running:
+                            return
+                        if not video_queue.require_keyframe_if_idle():
+                            continue  # the camera is back
+                        self._bootstrap_reset.set()
+                        # The stall watchdog covers this write too: FFmpeg
+                        # can wedge during a gap as well.
+                        self._video_write_started = time.monotonic()
+                    writer.write(held_keyframe)
+                    writer.flush()
+                    with self._ffmpeg_lock:
+                        if self._ffmpeg_proc is not proc:
+                            return
+                        self._video_write_started = 0.0
+                except (BrokenPipeError, OSError, ValueError):
+                    return
+                refeed_at = time.monotonic() + _KEEPALIVE_INTERVAL
                 continue
 
             try:
                 now = time.monotonic()
                 if next_write_at > now:
                     time.sleep(next_write_at - now)
-                if reset_bootstrap:
-                    self._bootstrap_reset.set()
-                proc.stdin.write(data)
-                proc.stdin.flush()
-                self._last_video_write = time.monotonic()
+                with self._ffmpeg_lock:
+                    if self._ffmpeg_proc is not proc or not self._running:
+                        return
+                    if keyframe:
+                        self._bootstrap_reset.set()
+                    self._video_write_started = time.monotonic()
+                writer.write(data)
+                writer.flush()
+                with self._ffmpeg_lock:
+                    if self._ffmpeg_proc is not proc:
+                        return
+                    self._last_video_write = written_at = time.monotonic()
+                    self._video_write_started = 0.0
+                if keyframe:
+                    held_keyframe = data
                 with self._metrics_lock:
                     pacer_fps = self._pacer_fps
-                next_write_at = self._last_video_write + (1.0 / pacer_fps)
+                # Advance from the previous deadline, so write time and sleep
+                # overshoot never accumulate into latency, and drain a backlog
+                # proportionally faster (each queued second adds 1x) before
+                # VideoBuffer's age limit retires the whole GOP.
+                backlog_seconds = video_queue.qsize() / pacer_fps
+                interval = 1.0 / (pacer_fps * (1.0 + backlog_seconds))
+                next_write_at = max(next_write_at + interval, written_at)
             except (BrokenPipeError, OSError, ValueError):
                 return
 
+    def _keyframe_refeed_delay(self, refeed_at: float) -> float | None:
+        """Seconds until the held IDR is due in a video gap; None if not held.
+
+        Nothing is held once the bridge stops, while repeated failures pause
+        the camera, or after _KEEPALIVE_MAX_HOLD without real video.
+        """
+        now = time.monotonic()
+        last_video = self._last_real_video
+        if (
+            not self._running
+            or self._failure_cooldown_until > now
+            or now - last_video > _KEEPALIVE_MAX_HOLD
+        ):
+            return None
+        return max(0.0, last_video + _KEEPALIVE_GAP - now, refeed_at - now)
+
     def _video_keepalive(self, proc: subprocess.Popen) -> None:
-        # CloudEdge sources stall in two cases that would otherwise make the HLS
-        # playlist stop advancing and the player give up: a slow cold-start wake
-        # (the camera needs ~5-20s to leave dormancy) and shared/throttled cameras
-        # whose live grant ends after ~15-20s before a fresh window re-establishes.
-        # Re-feeding the most recent *keyframe* keeps the muxer/playlist advancing
-        # with a held frame (decoder-safe: keyframes are self-contained, no broken
-        # P-frame references) until real video resumes.
+        # Watch this muxer's process. Video gaps are bridged by the pacer, the
+        # only writer, which re-feeds the held IDR (see _video_pacer).
+        started = time.monotonic()
         while True:
             if proc.poll() is not None:
+                # FFmpeg exited by itself (crash, OOM kill): its pacer and
+                # reader are gone, yet the keyframe gate is still open, so no
+                # frame would ever start a replacement. Stop and format
+                # changes retire the process first and do not get here.
+                with self._ffmpeg_lock:
+                    if self._ffmpeg_proc is proc and self._running:
+                        if time.monotonic() - started < _MUXER_QUICK_EXIT:
+                            self._muxer_quick_exits += 1
+                        else:
+                            self._muxer_quick_exits = 0
+                        if self._muxer_quick_exits < _MUXER_QUICK_EXITS:
+                            _LOGGER.warning(
+                                "ffmpeg for %s exited unexpectedly (code %s) — "
+                                "restarting the muxer at the next keyframe",
+                                self._serial_number,
+                                proc.returncode,
+                            )
+                        else:
+                            _LOGGER.error(
+                                "ffmpeg for %s exited right after each of its "
+                                "last %d starts (code %s); no live video until "
+                                "the camera's next session",
+                                self._serial_number,
+                                self._muxer_quick_exits,
+                                proc.returncode,
+                            )
+                        self._restart_muxer_at_next_keyframe_locked()
                 return
             time.sleep(0.5)
-            if not self._running:
+            if not self._running or self._ffmpeg_proc is not proc:
                 return
 
             # Muxer watchdog: bad input timestamps can wedge ffmpeg (mux
@@ -1035,93 +1438,66 @@ class CloudEdgeStreamBridge:
             # dropped as "backlogged" forever. Frames queued but nothing
             # written for too long means exactly that: kill this ffmpeg so
             # the pipeline restarts on the next keyframe.
-            stall_now = time.monotonic()
-            if (
-                self._last_video_write
-                and not self._video_queue.empty()
-                and stall_now - self._last_video_write > _MUX_STALL_TIMEOUT
-            ):
-                _LOGGER.warning(
-                    "ffmpeg for %s stopped consuming input for %.0fs — "
-                    "restarting the muxer",
-                    self._serial_number,
-                    stall_now - self._last_video_write,
-                )
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
-                # Drain stale frames and reopen the keyframe gate so the
-                # next IDR starts a fresh muxer.
-                while not self._video_queue.empty():
+            with self._ffmpeg_lock:
+                if self._ffmpeg_proc is not proc or not self._running:
+                    return
+                stall_now = time.monotonic()
+                if (
+                    self._video_write_started
+                    and stall_now - self._video_write_started > _MUX_STALL_TIMEOUT
+                ):
+                    _LOGGER.warning(
+                        "ffmpeg for %s stopped consuming input for %.0fs — "
+                        "restarting the muxer",
+                        self._serial_number,
+                        stall_now - self._video_write_started,
+                    )
                     try:
-                        self._video_queue.get_nowait()
-                    except queue.Empty:
-                        break
-                self._got_keyframe = False
-                with self._audio_buffer_lock:
-                    self._audio_buffer.clear()
-                # Stale timestamp must not trip the next watchdog before the
-                # new pacer's first write.
-                self._last_video_write = 0.0
-                return
+                        proc.kill()
+                    except Exception:
+                        pass
+                    self._restart_muxer_at_next_keyframe_locked()
+                    return
 
-            kf = self._latest_keyframe
-            if not kf:
-                continue
-            now = time.monotonic()
-            # Bound the hold: if no real video for too long, the camera is likely
-            # offline — stop masking it with a frozen frame and let the stream
-            # stall so it surfaces as an error.
-            if self._last_real_video and now - self._last_real_video > _KEEPALIVE_MAX_HOLD:
-                continue
-            if now - self._last_video_write > 0.5 and self._video_queue.empty():
-                self._enqueue_video(kf)
+    def _restart_muxer_at_next_keyframe_locked(self) -> None:
+        """Drop input queued for a dead or wedged muxer and reopen the gate.
 
-    def _enqueue_video(self, data: bytes, *, reset_bootstrap: bool = False) -> None:
-        try:
-            self._video_queue.put_nowait((data, reset_bootstrap))
-        except queue.Full:
-            _LOGGER.debug("Dropping video frame for %s because ffmpeg is backlogged", self._serial_number)
+        on_video starts a muxer only while _got_keyframe is False: the
+        camera's next IDR then starts a fresh FFmpeg on the same HA socket,
+        unless this attempt's FFmpeg processes kept exiting at once.
+        """
+        self._video_queue.clear()
+        self._got_keyframe = False
+        with self._audio_buffer_lock:
+            self._audio_buffer.clear()
+        # A stale timestamp must not trip the next watchdog before the new
+        # pacer's first write.
+        self._last_video_write = 0.0
+        self._video_write_started = 0.0
+
+    def _enqueue_video(self, data: bytes, *, reset_bootstrap: bool = False) -> bool:
+        accepted = self._video_queue.put(data, reset_bootstrap)
+        if not accepted:
+            # stream_dropped_frames counts these admission refusals only.
+            # Frames discarded after admission (with a retired GOP, or a
+            # cleared queue) are not counted. Frame rate and gaps are measured
+            # at receipt, so these refusals are what show FFmpeg or the pacer
+            # behind, or a gap bridged with the held IDR (predicted frames
+            # until the camera's next IDR).
+            with self._metrics_lock:
+                self._video_dropped_frames += 1
+            _LOGGER.debug(
+                "Dropping video frame for %s: ffmpeg is backlogged or a keyframe "
+                "is awaited",
+                self._serial_number,
+            )
+        return accepted
 
     def _get_stream_device(self) -> dict | None:
         device = self._coordinator.get_device_for_stream(self._serial_number)
         if device is None:
             _LOGGER.warning("No device data available for live stream %s", self._serial_number)
         return device
-
-    def _set_live_switch(self, device: dict, enabled: bool) -> bool:
-        """Set parameter 167 once for the whole HA viewing session."""
-        client = self._coordinator.client
-        if client is None or not hasattr(client, "set_device_config"):
-            return False
-        serial_number = device.get("serial_number") or self._serial_number
-        try:
-            changed = bool(
-                client.set_device_config(
-                    serial_number,
-                    {"167": 1 if enabled else 0},
-                    auto_wake=False,
-                    device_id=device.get("device_id"),
-                )
-            )
-            if changed:
-                with self._metrics_lock:
-                    self._live_switch_enabled = enabled
-                _LOGGER.debug(
-                    "Live-stream switch 167=%d for %s",
-                    1 if enabled else 0,
-                    serial_number,
-                )
-            return changed
-        except Exception as err:
-            _LOGGER.debug(
-                "Could not %s live-stream switch for %s: %s",
-                "enable" if enabled else "disable",
-                serial_number,
-                err,
-            )
-            return False
 
     def _record_stream_attempt(
         self,
@@ -1198,17 +1574,20 @@ class CloudEdgeStreamBridge:
 
     def _resolve_active_video_id(self, device: dict) -> int:
         """Resolve Auto/HD/SD against the camera's advertised profiles."""
-        main_id, substream_id, available = resolve_stream_profile_ids(device)
-        self._main_video_id = main_id
-        self._substream_video_id = substream_id
+        hd_id, sd_id, available = resolve_stream_profile_ids(device)
+        auto_id, auto_fallback_id = resolve_auto_stream_ids(device)
+        self._main_video_id = auto_id
+        self._substream_video_id = auto_fallback_id
+        self._hd_video_id = hd_id
+        self._sd_video_id = sd_id
         self._available_video_ids = available
 
         if self._stream_profile == STREAM_PROFILE_MAIN:
-            selected = main_id
+            selected = hd_id
         elif self._stream_profile == STREAM_PROFILE_SUBSTREAM:
-            selected = substream_id
-        elif self._active_video_id not in (main_id, substream_id):
-            selected = main_id
+            selected = sd_id
+        elif self._active_video_id not in (auto_id, auto_fallback_id):
+            selected = auto_id
         else:
             selected = self._active_video_id
 
@@ -1360,8 +1739,8 @@ class CloudEdgeStreamBridge:
     def _stream_worker(self, gen: int) -> None:
         consecutive_failures = 0
         device: dict | None = None
-        bridge_owns_live_switch = False
         attempt_number = 0
+        stop_reason = "worker_exit"
 
         def _session_active() -> bool:
             return self._running and gen == self._session_generation
@@ -1399,13 +1778,18 @@ class CloudEdgeStreamBridge:
                     self._serial_number,
                 )
 
+            if not _session_active():
+                return
+
             try:
                 create_parameters = inspect.signature(client.create_streamer).parameters
             except (TypeError, ValueError):
                 create_parameters = {}
+            # IoT 167 is FRONT_LIGHT_SWITCH (the floodlight), not a live-view
+            # flag: the vendor app never writes it to start live view and the
+            # cameras stream the same window without it. pycloudedge <= 0.1.11
+            # toggles it by default, so opt out explicitly.
             supports_external_switch = "manage_stream_switch" in create_parameters
-            if supports_external_switch:
-                bridge_owns_live_switch = self._set_live_switch(device, True)
 
             while _session_active():
                 if not self._should_keep_running():
@@ -1417,115 +1801,127 @@ class CloudEdgeStreamBridge:
                     time.sleep(2)
                     continue
 
-                attempt_logged_in = False
-                attempt_frames = 0
-                attempt_bytes = 0
-                attempt_started = time.monotonic()
-                first_frame_at = 0.0
-                last_frame_at = 0.0
-                max_frame_gap = 0.0
-                attempt_number += 1
-                if attempt_number > 1:
+                with self._lock:
+                    if not _session_active():
+                        return
+                    attempt_logged_in = False
+                    attempt_codec: str | None = None
+                    parameter_cache: dict[int, bytes] = {}
+                    self._attempt_generation += 1
+                    token = self._attempt_generation
+                    attempt_frames = 0
+                    attempt_bytes = 0
+                    attempt_started = time.monotonic()
+                    first_frame_at = 0.0
+                    last_frame_at = 0.0
+                    max_frame_gap = 0.0
+                    attempt_number += 1
+                    if attempt_number > 1:
+                        with self._metrics_lock:
+                            self._reconnect_count += 1
+                    self._got_keyframe = False
+                    self._muxer_quick_exits = 0
+                    self._profile_changed.clear()
+                    video_id = self._resolve_active_video_id(device)
                     with self._metrics_lock:
-                        self._reconnect_count += 1
-                self._got_keyframe = False
-                # Parameter sets are profile/resolution specific: never carry
-                # them into a new attempt (the profile may have switched).
-                self._pending_param_sets = None
-                self._profile_changed.clear()
-                video_id = self._resolve_active_video_id(device)
-                with self._metrics_lock:
-                    self._stream_state = "connecting"
-                    if (
-                        video_id == self._substream_video_id
-                        and self._substream_video_id != self._main_video_id
-                    ):
-                        self._pacer_fps = _SUBSTREAM_INITIAL_FPS
+                        self._stream_state = "connecting"
+                        if (
+                            video_id == self._substream_video_id
+                            and self._substream_video_id != self._main_video_id
+                        ):
+                            self._pacer_fps = _SUBSTREAM_INITIAL_FPS
                 self._coordinator.notify_stream_state_changed()
 
-                def on_video(frame_data: bytes) -> None:
-                    nonlocal attempt_frames, attempt_bytes
+                def _attempt_active(callback_token: int) -> bool:
+                    return _session_active() and callback_token == self._attempt_generation
+
+                def on_video(frame_data: bytes, _token: int = token) -> None:
+                    nonlocal attempt_frames, attempt_bytes, attempt_codec
                     nonlocal first_frame_at, last_frame_at, max_frame_gap
-                    if gen != self._session_generation:
-                        # Stale callback from a previous session: drop it.
+                    if not _attempt_active(_token):
                         return
+                    frame_data = _convert_to_annex_b(frame_data)
+                    # Split once: every decision below reads these units.
+                    nal_units = _split_nal_units(frame_data)
+                    detected_codec = _detect_video_codec(nal_units)
+                    if detected_codec is not None and detected_codec != attempt_codec:
+                        # Detection belongs to this P2P attempt, never to the
+                        # retired muxer. Profiles can change codec/resolution.
+                        attempt_codec = detected_codec
+                        parameter_cache.clear()
+                        self._got_keyframe = False
+                    codec = attempt_codec
+                    if codec is None:
+                        return
+                    required = (7, 8) if codec == "h264" else (32, 33, 34)
+                    slices = []
+                    parameters_changed = False
+                    for nal in nal_units:
+                        nal_type = (nal[0] & 0x1F) if codec == "h264" else ((nal[0] >> 1) & 0x3F)
+                        if nal_type in required:
+                            encoded = b"\x00\x00\x00\x01" + nal
+                            if parameter_cache.get(nal_type) != encoded:
+                                parameters_changed = True
+                            parameter_cache[nal_type] = encoded
+                        else:
+                            slices.append(b"\x00\x00\x00\x01" + nal)
+                    if parameters_changed and self._got_keyframe:
+                        self._got_keyframe = False
+                    is_keyframe = _is_video_keyframe(nal_units, codec)
+                    has_slice = any(
+                        (1 <= nal[0] & 0x1F <= 5) if codec == "h264"
+                        else ((nal[0] >> 1) & 0x3F) <= 31
+                        for nal in nal_units
+                    )
+                    if not has_slice:
+                        return
+                    if not self._got_keyframe and not is_keyframe:
+                        return
+                    if any(kind not in parameter_cache for kind in required):
+                        return
+                    parameter_sets = b"".join(parameter_cache[kind] for kind in required)
+                    if is_keyframe:
+                        # Every decoder entry point is self-contained, including
+                        # separately delivered parameter sets and reconnects.
+                        frame_data = parameter_sets + b"".join(slices)
+                    if not self._got_keyframe:
+                        if self._muxer_quick_exits >= _MUXER_QUICK_EXITS:
+                            return  # FFmpeg cannot run: see _video_keepalive
+                        if not self._start_ffmpeg_muxer(
+                            codec, parameter_sets=parameter_sets, first_keyframe=frame_data,
+                            generation=gen, attempt_generation=_token,
+                        ):
+                            _LOGGER.error("Failed to start %s muxer for %s", codec, self._serial_number)
+                            return
+                        self._got_keyframe = True
+                    # Measure the network source at receipt. Frames VideoBuffer
+                    # rejects after its own overload retirement must not read
+                    # as network gaps or a lower source rate (Auto profile and
+                    # pacer cadence would otherwise feed back on the drops).
                     received_at = time.monotonic()
                     attempt_frames += 1
                     attempt_bytes += len(frame_data)
                     if not first_frame_at:
                         first_frame_at = received_at
+                        self._failure_cooldown_until = 0.0
+                        self._consecutive_stream_failures = 0
+                        with self._metrics_lock:
+                            self._stream_state = "streaming"
+                        self._coordinator.notify_stream_state_changed()
+                        _LOGGER.info("First live %s keyframe received for %s (%d bytes)", codec, self._serial_number, len(frame_data))
                     if last_frame_at:
                         max_frame_gap = max(max_frame_gap, received_at - last_frame_at)
                     last_frame_at = received_at
+                    self._last_real_video = received_at
                     media_span = received_at - first_frame_at
                     if attempt_frames >= 5 and media_span >= 2.0:
-                        observed_fps = (attempt_frames - 1) / media_span
-                        observed_fps = max(
-                            _PACER_MIN_FPS,
-                            min(_PACER_MAX_FPS, observed_fps),
-                        )
+                        observed_fps = max(_PACER_MIN_FPS, min(_PACER_MAX_FPS, (attempt_frames - 1) / media_span))
                         with self._metrics_lock:
-                            # Smooth enough to avoid oscillating on individual
-                            # packets, but react quickly after a multi-second gap.
-                            self._pacer_fps = (
-                                self._pacer_fps * 0.5 + observed_fps * 0.5
-                            )
-
-                    frame_data = _convert_to_annex_b(frame_data)
-                    codec = self._video_codec or _detect_video_codec(frame_data)
-                    if codec is None:
-                        return
-                    is_keyframe = _is_video_keyframe(frame_data, codec)
-                    if not self._got_keyframe:
-                        if not is_keyframe:
-                            # Some cameras send SPS/PPS in a separate access
-                            # unit before the IDR; cache them instead of
-                            # dropping, or the decoder can never start
-                            # ("non-existing PPS referenced").
-                            param_sets = _extract_parameter_sets(frame_data, codec)
-                            if param_sets:
-                                self._pending_param_sets = param_sets
-                            return
-                        if not _extract_parameter_sets(frame_data, codec):
-                            if self._pending_param_sets:
-                                frame_data = self._pending_param_sets + frame_data
-                            else:
-                                _LOGGER.debug(
-                                    "First IDR for %s has no SPS/PPS and none "
-                                    "cached; waiting for the next keyframe",
-                                    self._serial_number,
-                                )
-                                return
-                        if not self._start_ffmpeg_muxer(codec):
-                            _LOGGER.error(
-                                "Failed to start %s muxer for %s",
-                                codec,
-                                self._serial_number,
-                            )
-                            if gen == self._session_generation:
-                                self._running = False
-                            return
-                        self._got_keyframe = True
-                        _LOGGER.info(
-                            "First live %s keyframe received for %s (%d bytes)",
-                            codec,
-                            self._serial_number,
-                            len(frame_data),
-                        )
-                    self._last_real_video = time.monotonic()
-                    if is_keyframe:
-                        # Remembered for the keepalive: a held frame to re-feed
-                        # during wake / live-window gaps so HLS keeps advancing.
-                        self._latest_keyframe = frame_data
+                            self._pacer_fps = self._pacer_fps * 0.5 + observed_fps * 0.5
                     self._enqueue_video(frame_data, reset_bootstrap=is_keyframe)
 
-                def on_audio(audio_data: bytes) -> None:
-                    # G.711 µ-law payload from the camera (8 kHz mono).
-                    # Buffered until the audio writer drains it; capped so a
-                    # stalled pipeline cannot grow memory or add latency.
-                    if gen != self._session_generation or not self._got_keyframe:
-                        return
-                    if not audio_data:
+                def on_audio(audio_data: bytes, _token: int = token) -> None:
+                    if not _attempt_active(_token) or not self._got_keyframe or not audio_data:
                         return
                     with self._metrics_lock:
                         self._audio_frames += 1
@@ -1537,28 +1933,42 @@ class CloudEdgeStreamBridge:
                         if excess > 0:
                             del self._audio_buffer[:excess]
 
-                def on_login() -> None:
+                def on_login(_token: int = token) -> None:
                     nonlocal attempt_logged_in
+                    if not _attempt_active(_token):
+                        return
                     attempt_logged_in = True
-                    self._failure_cooldown_until = 0.0
-                    self._consecutive_stream_failures = 0
                     self._last_online_confirmation = time.monotonic()
-                    self._coordinator.set_runtime_connection_status(
-                        self._serial_number,
-                        "online",
-                    )
-                    with self._metrics_lock:
-                        self._stream_state = "streaming"
-                    _LOGGER.info("Live stream connected for %s", self._serial_number)
+                    self._coordinator.set_runtime_connection_status(self._serial_number, "online")
+                    # Authentication alone does not prove the media path works.
+                    # Retry accounting and streaming state change on valid video.
+                    _LOGGER.info("Live stream authenticated for %s", self._serial_number)
                     self._coordinator.notify_stream_state_changed()
 
-                def on_disconnect() -> None:
+                def on_disconnect(_token: int = token) -> None:
+                    if not _attempt_active(_token):
+                        return
                     with self._metrics_lock:
-                        if self._running:
-                            self._stream_state = "reconnecting"
+                        self._stream_state = "reconnecting"
                     _LOGGER.info("Live stream disconnected for %s", self._serial_number)
                     self._coordinator.notify_stream_state_changed()
 
+                def guarded(callback, callback_token: int):
+                    def invoke(*args):
+                        # Stop/start and media admission share one order:
+                        # bridge lock -> muxer lock -> consumer lock. A callback
+                        # paused before startup cannot resurrect retired media.
+                        with self._lock:
+                            if _attempt_active(callback_token):
+                                callback(*args)
+                    return invoke
+
+                on_video = guarded(on_video, token)
+                on_audio = guarded(on_audio, token)
+                on_login = guarded(on_login, token)
+                on_disconnect = guarded(on_disconnect, token)
+
+                streamer = None
                 try:
                     create_kwargs = dict(
                         device=device,
@@ -1571,33 +1981,46 @@ class CloudEdgeStreamBridge:
                     if _AUDIO_ENABLED and "on_audio" in create_parameters:
                         create_kwargs["on_audio"] = on_audio
                     if supports_external_switch:
-                        create_kwargs["manage_stream_switch"] = not bridge_owns_live_switch
-                    self._p2p_streamer = client.create_streamer(**create_kwargs)
-                    if self._p2p_streamer is None:
+                        create_kwargs["manage_stream_switch"] = False
+                    streamer = client.create_streamer(**create_kwargs)
+                    if streamer is None:
                         _LOGGER.error("Failed to create P2P streamer for %s", self._serial_number)
                         return
+                    with self._lock:
+                        if not _attempt_active(token):
+                            streamer.request_stop()
+                            if _session_active():
+                                # Only this attempt was retired (profile
+                                # change): start the next one, keep the session.
+                                continue
+                            return
+                        self._p2p_streamer = streamer
                     _LOGGER.debug(
                         "Using CloudEdge video_id=%d for %s",
                         video_id,
                         self._serial_number,
                     )
                     if not getattr(
-                        self._p2p_streamer,
+                        streamer,
                         "_cloudedge_native_signaling_retry",
                         False,
                     ):
-                        self._patch_streamer_status_retry(self._p2p_streamer)
-                    result = self._p2p_streamer.run_session()
-                    if isinstance(result, tuple) and len(result) == 2:
-                        attempt_frames = max(attempt_frames, int(result[0]))
-                        attempt_bytes = max(attempt_bytes, int(result[1]))
+                        self._patch_streamer_status_retry(streamer)
+                    streamer.run_session()
                 except Exception as err:
                     with self._metrics_lock:
                         self._last_error = str(err)
                     _LOGGER.error("P2P stream failed for %s: %s", self._serial_number, err)
                 finally:
-                    self._p2p_streamer = None
+                    with self._lock:
+                        if gen == self._session_generation:
+                            if token == self._attempt_generation:
+                                self._attempt_generation += 1
+                            if self._p2p_streamer is streamer:
+                                self._p2p_streamer = None
 
+                if gen != self._session_generation:
+                    return
                 attempt_duration = time.monotonic() - attempt_started
                 media_duration = (
                     last_frame_at - first_frame_at
@@ -1615,36 +2038,47 @@ class CloudEdgeStreamBridge:
                 )
                 self._coordinator.notify_stream_state_changed()
 
-                if attempt_logged_in:
+                if attempt_frames:
                     self._consecutive_stream_failures = 0
+                elif self._bridge_stopped_attempt >= token:
+                    # Stopped by the bridge, not a camera failure. Attempts run
+                    # one at a time and generations only grow, so a mark at or
+                    # past this token was set after this attempt began: by a
+                    # stop of this attempt (a second one, while it was still
+                    # closing, records a later generation) or by a profile
+                    # change just after it ended, which resets the count.
+                    pass
                 else:
                     self._consecutive_stream_failures += 1
                     if (
                         self._consecutive_stream_failures
                         >= _MAX_CONSECUTIVE_STREAM_FAILURES
                     ):
-                        self._failure_cooldown_until = (
-                            time.monotonic() + _FAILED_SESSION_COOLDOWN
+                        cooldown = _failed_session_cooldown(
+                            self._consecutive_stream_failures
                         )
+                        self._failure_cooldown_until = time.monotonic() + cooldown
                         with self._metrics_lock:
                             self._stream_state = "retry_cooldown"
                             self._last_error = (
                                 "Live stream failed repeatedly; automatic retries "
-                                f"paused for {_FAILED_SESSION_COOLDOWN:.0f}s"
+                                f"paused for {cooldown:.0f}s"
                             )
                         _LOGGER.warning(
                             "Live stream for %s failed %d times in a row; pausing "
                             "automatic retries for %.0fs",
                             self._serial_number,
                             self._consecutive_stream_failures,
-                            _FAILED_SESSION_COOLDOWN,
+                            cooldown,
                         )
+                        # The stop reason is the state for the whole pause.
+                        stop_reason = "retry_cooldown"
                         return
 
                 # Keep the local listener available for the idle grace period,
                 # but do not consume battery by opening another P2P window when
                 # Home Assistant no longer has an active MPEG-TS consumer.
-                if not self.client_count:
+                if not self._wait_for_stream_consumer(gen):
                     return
                 if not self._should_keep_running():
                     return
@@ -1662,7 +2096,7 @@ class CloudEdgeStreamBridge:
                 while time.monotonic() < cooldown_until:
                     if (
                         not _session_active()
-                        or not self.client_count
+                        or not self._wait_for_stream_consumer(gen)
                         or not self._should_keep_running()
                     ):
                         return
@@ -1670,13 +2104,11 @@ class CloudEdgeStreamBridge:
                         break
                     time.sleep(0.5)
         finally:
-            if bridge_owns_live_switch and device is not None:
-                self._set_live_switch(device, False)
             # Only tear down the pipeline we belong to: a stale worker from
             # a previous session must not stop the live one.
             with self._lock:
                 if gen == self._session_generation:
-                    self._stop_locked("worker_exit")
+                    self._stop_locked(stop_reason)
 
     def _wake_camera_if_needed(self, device: dict) -> bool:
         client = self._coordinator.client
@@ -1740,13 +2172,26 @@ class CloudEdgeStreamBridge:
             return True
         return (now - max(self._last_request_time, self._last_client_time)) < _IDLE_TIMEOUT
 
+    def _wait_for_stream_consumer(self, gen: int) -> bool:
+        """Allow only a format restart a short reconnect window."""
+        while self._running and gen == self._session_generation:
+            if self.client_count:
+                return True
+            if time.monotonic() >= self._source_restart_until:
+                return False
+            time.sleep(0.05)
+        return False
+
     def _idle_watch_loop(self, gen: int) -> None:
         while self._running and gen == self._session_generation:
             time.sleep(1)
             if self._should_keep_running():
                 continue
             _LOGGER.debug("Stopping idle live stream for %s", self._serial_number)
-            streamer = self._p2p_streamer
+            with self._lock:
+                streamer = self._p2p_streamer
+                if streamer is not None:
+                    self._bridge_stopped_attempt = self._attempt_generation
             if streamer is not None:
                 try:
                     streamer.request_stop()
@@ -1793,14 +2238,16 @@ class CloudEdgeStreamManager:
         """Return diagnostics without starting a new bridge."""
         with self._lock:
             bridge = self._bridges.get(serial_number)
+        # As an idle bridge: no stream opened, the camera's profiles unknown.
         return bridge.diagnostics() if bridge else {
             "stream_profile": STREAM_PROFILE_AUTO,
-            "stream_profile_active": STREAM_PROFILE_MAIN,
+            "stream_profile_active": None,
             "stream_video_id": None,
-            "stream_main_video_id": 0,
-            "stream_substream_video_id": 1,
-            "stream_available_video_ids": [0, 1],
+            "stream_main_video_id": None,
+            "stream_substream_video_id": None,
+            "stream_available_video_ids": [],
             "stream_state": "idle",
+            "stream_dropped_frames": 0,
             "stream_audio_codec": "pcm_mulaw/8000",
             "stream_audio_frames": 0,
             "stream_audio_bytes": 0,
@@ -1808,10 +2255,19 @@ class CloudEdgeStreamManager:
         }
 
     def stop_all(self) -> None:
+        """Stop every bridge, then let their P2P sessions finish closing.
+
+        Runs on unload and on Home Assistant stop, from the executor. The join
+        is bounded (one deadline for all bridges): a worker stuck in network
+        I/O must not hold up the unload or the shutdown.
+        """
         with self._lock:
             bridges = list(self._bridges.values())
-        for bridge in bridges:
-            bridge.stop("manager_stop")
+        workers = [bridge.stop("manager_stop") for bridge in bridges]
+        deadline = time.monotonic() + _STOP_JOIN_TIMEOUT
+        for worker in workers:
+            if worker is not None and worker is not threading.current_thread():
+                worker.join(max(0.0, deadline - time.monotonic()))
 
     def remove_missing(self, serial_numbers: set[str]) -> None:
         with self._lock:

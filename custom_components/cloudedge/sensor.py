@@ -24,6 +24,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from . import CloudEdgeCoordinator
 from .const import (
     DOMAIN,
+    SECRET_PARAMETER_CODES,
     SENSOR_PARAMETERS,
     ENABLED_BY_DEFAULT_SENSOR_PARAMS,
 )
@@ -58,10 +59,17 @@ async def async_setup_entry(
                 coordinator, serial_number, device_info
             ))
 
-            config = dict(device_info.get("configuration") or {})
+            # Device secrets never become sensors.
+            config = {
+                code: info
+                for code, info in (device_info.get("configuration") or {}).items()
+                if code not in SECRET_PARAMETER_CODES
+            }
             # Restore known identities even if the cloud is unavailable at
             # startup. Their availability still depends on actual data.
             for code, info in IOT_PARAMETERS.items():
+                if code in SECRET_PARAMETER_CODES:
+                    continue  # never restore a device-secret sensor
                 name = curated_names.get(code, info["name"].lower())
                 unique_id = f"{DOMAIN}_{serial_number}_{name}"
                 if registry.async_get_entity_id("sensor", DOMAIN, unique_id):
@@ -396,7 +404,8 @@ class CloudEdgeDeviceStatusSensor(CloudEdgeBaseSensor):
             "serial_number": self._serial_number,
             "device_type": device_data.get("type"),
             "device_id": device_data.get("device_id"),
-            "host_key": device_data.get("host_key"),
+            # host_key is the camera's P2P/VVP login secret: never publish it
+            # in states (readable by every HA user and kept by the recorder).
             "home_id": device_data.get("home_id"),
             "last_seen": device_data.get("last_seen"),
             "online": device_data.get("online", False),

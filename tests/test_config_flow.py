@@ -182,3 +182,22 @@ def test_reauth_with_bad_credentials_keeps_the_form_open():
         hass.config_entries.async_update_entry.assert_not_called()
 
     asyncio.run(run())
+
+
+def test_validation_counts_devices_without_pinging_them():
+    # Validation only needs the device count; the default client also read
+    # each device's configuration and pinged it on the local network.
+    from custom_components.cloudedge.config_flow import validate_input
+
+    async def run():
+        hass = make_hass()
+        hass.async_add_executor_job = AsyncMock(side_effect=lambda fn, *args: fn(*args))
+        with patch("cloudedge.CloudEdgeClient") as client_type:
+            client = client_type.return_value
+            client.authenticate.return_value = True
+            client.get_all_devices.return_value = [{"name": "A"}, {"name": "B"}]
+            info = await validate_input(hass, dict(USER_INPUT))
+        assert info["device_count"] == 2
+        assert client_type.call_args.kwargs["enable_network_ping"] is False
+
+    asyncio.run(run())

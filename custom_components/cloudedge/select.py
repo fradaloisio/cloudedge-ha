@@ -88,9 +88,13 @@ class CloudEdgeStreamProfileSelect(
             profile = normalize_stream_profile(previous.state) if previous else STREAM_PROFILE_AUTO
         except ValueError:
             profile = STREAM_PROFILE_AUTO
-        self.coordinator.set_stream_profile(self._serial_number, profile)
+        await self.hass.async_add_executor_job(
+            self.coordinator.set_stream_profile, self._serial_number, profile
+        )
 
     async def async_select_option(self, option: str) -> None:
         """Apply a new stream profile."""
-        self.coordinator.set_stream_profile(self._serial_number, option)
+        await self.hass.async_add_executor_job(
+            self.coordinator.set_stream_profile, self._serial_number, option
+        )
         self.async_write_ha_state()

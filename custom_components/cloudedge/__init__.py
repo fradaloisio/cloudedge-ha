@@ -12,13 +12,15 @@ import logging
 import os
 import threading
 import time
+from collections.abc import Callable
+from concurrent.futures import Future
 from datetime import datetime, timedelta, timezone
 from functools import partial
 from typing import Dict, Any
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import Platform
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.const import EVENT_HOMEASSISTANT_STOP, Platform
+from homeassistant.core import Event, HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady, HomeAssistantError
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
@@ -75,15 +77,26 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         raise ConfigEntryNotReady(f"CloudEdge not reachable: {err}") from err
 
     try:
-        # Fetch initial data with error handling
-        success = await coordinator.async_safe_first_refresh()
-        if not success:
-            _LOGGER.warning("Initial setup had issues, integration will retry on next update")
+        # A failed first refresh raises ConfigEntryNotReady, so Home Assistant
+        # retries the setup with its own backoff instead of loading an entry
+        # without entities until the next refresh interval.
+        await coordinator.async_safe_first_refresh()
 
         hass.data[DOMAIN][entry.entry_id] = coordinator
 
-        # Set up platforms even if initial refresh failed
-        # This allows the integration to load and retry later
+        # Home Assistant does not unload config entries when it stops, and the
+        # bridge and MQTT threads are daemons: without this, FFmpeg, the P2P
+        # session, the audio FIFO and the broker connection outlive a stop or
+        # restart. Both teardowns block (FFmpeg teardown, bounded worker
+        # joins, paho loop join), so keep them off the loop.
+        async def _async_stop_transports(_event: Event) -> None:
+            await hass.async_add_executor_job(coordinator._close_mqtt)
+            await hass.async_add_executor_job(coordinator.stop_streams)
+
+        entry.async_on_unload(
+            hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _async_stop_transports)
+        )
+
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
         # Set up services
@@ -94,7 +107,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         # the MQTT thread and stream bridges outlive the coordinator.
         hass.data[DOMAIN].pop(entry.entry_id, None)
         with contextlib.suppress(Exception):
-            await hass.async_add_executor_job(coordinator._stop_mqtt)
+            await hass.async_add_executor_job(coordinator._close_mqtt)
         with contextlib.suppress(Exception):
             await hass.async_add_executor_job(coordinator.stop_streams)
         raise
@@ -111,7 +124,9 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
         coordinator = hass.data[DOMAIN].pop(entry.entry_id, None)
         if coordinator is not None:
-            await hass.async_add_executor_job(coordinator._stop_mqtt)
+            # Close, not just stop: a poll still running in the executor
+            # must not restart MQTT on this dismissed coordinator.
+            await hass.async_add_executor_job(coordinator._close_mqtt)
             await hass.async_add_executor_job(coordinator.stop_streams)
         # Services are domain-wide: remove them only with the last entry
         if not hass.data[DOMAIN]:
@@ -179,11 +194,18 @@ class CloudEdgeCoordinator(DataUpdateCoordinator):
         self._last_updated_device = None  # Track which device was last updated
         self._last_update_time: datetime | None = None
         self._mqtt_listener = None
+        # Serializes MQTT listener start/stop. Once closed (unload, failed
+        # setup, HA stop) MQTT never starts again: a poll still running in
+        # the executor would otherwise restart it on a dismissed coordinator,
+        # stealing the broker session (same client id) from the new entry.
+        self._mqtt_lock = threading.Lock()
+        self._mqtt_closed = False
         # Guards _fetch_data: a coordinator-level timeout abandons the
         # executor thread but cannot cancel it, so a slow fetch must never
         # overlap the next attempt and race on client/session state.
         self._fetch_lock = threading.Lock()
         self._stream_manager = CloudEdgeStreamManager(self)
+        self._stream_source_listeners: dict[str, set[Callable[[], None]]] = {}
         
         _LOGGER.info(
             "Initializing CloudEdge coordinator with %d minute refresh interval",
@@ -226,6 +248,12 @@ class CloudEdgeCoordinator(DataUpdateCoordinator):
                     phone_code=self.phone_code,
                     debug=False,  # pycloudedge debug dumps raw API traffic (tokens) to logs
                     session_cache_file=self._session_cache_path(),
+                    # The OpenAPI state drives Connection Status, so a LAN
+                    # ping adds nothing: a sleeping camera rarely answers
+                    # (pycloudedge <= 0.1.11 then overrides the cloud's
+                    # online flag), and every poll and stream start pays a
+                    # config read and a ping per device.
+                    enable_network_ping=False,
                 )
 
             # Check if we have valid session data
@@ -310,6 +338,17 @@ class CloudEdgeCoordinator(DataUpdateCoordinator):
 
     def _start_mqtt(self) -> None:
         """Start the MQTT listener for real-time push events."""
+        # Held across start(), which is non-blocking (connect_async): a
+        # concurrent close then waits for the listener and stops it, instead
+        # of missing one that is assigned just after.
+        with self._mqtt_lock:
+            if self._mqtt_closed:
+                _LOGGER.debug("_start_mqtt: coordinator closed, MQTT stays stopped")
+                return
+            self._start_mqtt_locked()
+
+    def _start_mqtt_locked(self) -> None:
+        """Start the MQTT listener; the caller holds _mqtt_lock."""
         _LOGGER.info("_start_mqtt called (listener=%s)", self._mqtt_listener is not None)
         if self._mqtt_listener is not None:
             return
@@ -400,7 +439,8 @@ class CloudEdgeCoordinator(DataUpdateCoordinator):
                 break
 
         # Push coordinator update (drives binary_sensor, sensor, camera, etc.)
-        self.async_set_updated_data(new_data)
+        if matched_sn is not None:
+            self._async_set_runtime_data(new_data)
 
         # Download and decrypt the alarm snapshot without blocking the loop
         if alarm_url and matched_sn:
@@ -449,14 +489,22 @@ class CloudEdgeCoordinator(DataUpdateCoordinator):
         _LOGGER.info(
             "Alarm snapshot decrypted for %s (%d bytes)", matched_name, len(jpeg)
         )
-        self.async_set_updated_data(new_data)
+        self._async_set_runtime_data(new_data)
 
     def _stop_mqtt(self) -> None:
-        """Stop the MQTT listener."""
-        if self._mqtt_listener is not None:
-            self._mqtt_listener.stop()
-            self._mqtt_listener = None
+        """Stop the MQTT listener; a later _start_mqtt may start a new one."""
+        with self._mqtt_lock:
+            listener, self._mqtt_listener = self._mqtt_listener, None
+        if listener is not None:
+            # Outside the lock: stop() joins the paho thread.
+            listener.stop()
             _LOGGER.debug("CloudEdge MQTT listener stopped")
+
+    def _close_mqtt(self) -> None:
+        """Stop MQTT for good (unload, failed setup, Home Assistant stop)."""
+        with self._mqtt_lock:
+            self._mqtt_closed = True
+        self._stop_mqtt()
 
     def _authenticate_client(self, *, force_refresh: bool = False) -> bool:
         """Authenticate and keep MQTT credentials aligned with the session."""
@@ -512,9 +560,21 @@ class CloudEdgeCoordinator(DataUpdateCoordinator):
         )
 
     @callback
+    def _async_set_runtime_data(self, data: Dict[str, Any]) -> None:
+        """Publish runtime state (MQTT push, alarm image, stream status).
+
+        Not async_set_updated_data: that reschedules the poll a full interval
+        later and marks the last poll successful. Frequent pushes would then
+        postpone polling indefinitely, revive entities after a failed poll,
+        and restart polling (a login retry) after an authentication failure.
+        """
+        self.data = data
+        self.async_update_listeners()
+
+    @callback
     def _async_publish_runtime_update(self) -> None:
-        """Publish current data, never a snapshot captured in a worker thread."""
-        self.async_set_updated_data(dict(self.data or {}))
+        """Notify entities on the loop; stream state lives outside data."""
+        self.async_update_listeners()
 
     def set_runtime_connection_status(self, serial_number: str, status: str) -> None:
         """Schedule stream status updates on the Home Assistant event loop."""
@@ -531,7 +591,7 @@ class CloudEdgeCoordinator(DataUpdateCoordinator):
             return
         if device_data.get("connection_status") == status:
             return
-        self.async_set_updated_data({
+        self._async_set_runtime_data({
             **self.data,
             serial_number: {**device_data, "connection_status": status},
         })
@@ -562,9 +622,11 @@ class CloudEdgeCoordinator(DataUpdateCoordinator):
             # fall through to the heuristic below.
             if hasattr(self.client, "get_device_online_status"):
                 api_status = self.client.get_device_online_status(serial_number)
-                if api_status in ("online", "offline"):
+                if api_status in ("online", "offline", "dormancy"):
+                    # The OpenAPI state is authoritative. The stored
+                    # ``online`` flag comes from getDeviceOnLine.action,
+                    # which reports False for every sleeping camera.
                     return api_status
-                # "dormancy" falls through to heuristic below
         except Exception as exc:
             _LOGGER.debug("connection_status API fetch failed for %s: %s", serial_number, exc)
 
@@ -613,6 +675,7 @@ class CloudEdgeCoordinator(DataUpdateCoordinator):
                     phone_code=self.phone_code,
                     debug=False,  # pycloudedge debug dumps raw API traffic (tokens) to logs
                     session_cache_file=self._session_cache_path(),
+                    enable_network_ping=False,  # see async_validate_authentication
                 )
 
             # Always validate and authenticate before making API calls
@@ -821,7 +884,13 @@ class CloudEdgeCoordinator(DataUpdateCoordinator):
             # Recover a failed login-time IoT fetch before retrying MQTT.
             # The library owns refresh throttling and credential locking;
             # older releases can only retry with their cached configuration.
-            if self._mqtt_listener is None and self.client is not None:
+            # A poll that outlives an unload (in flight or abandoned by the
+            # update timeout) must not restart MQTT on the closed coordinator.
+            if (
+                self._mqtt_listener is None
+                and self.client is not None
+                and not self._mqtt_closed
+            ):
                 try:
                     refresh_mqtt = getattr(self.client, "refresh_mqtt_config", None)
                     mqtt_config = (
@@ -1048,6 +1117,61 @@ class CloudEdgeCoordinator(DataUpdateCoordinator):
         """Tell entity listeners that live stream state changed."""
         self._publish_runtime_update()
 
+    @callback
+    def async_add_stream_source_listener(
+        self, serial_number: str, listener: Callable[[], None]
+    ) -> Callable[[], None]:
+        """Listen for format changes that require the HA decoder to reopen."""
+        self._stream_source_listeners.setdefault(serial_number, set()).add(listener)
+
+        @callback
+        def remove_listener() -> None:
+            listeners = self._stream_source_listeners.get(serial_number)
+            if listeners is not None:
+                listeners.discard(listener)
+                if not listeners:
+                    self._stream_source_listeners.pop(serial_number, None)
+
+        return remove_listener
+
+    def notify_stream_source_changed(
+        self, serial_number: str, close_consumers: Callable[[], None]
+    ) -> bool:
+        """From a media thread, arm HA's fast restart before sending TCP EOF.
+
+        A normal state notification is asynchronous: EOF could reach HA first
+        and put it into retry backoff. Keep these two operations ordered on the
+        event loop and wait before allowing a different format onto the stream.
+        ``close_consumers`` must only close old sockets, without waiting for a
+        worker or acquiring a lock held by the calling thread.
+        """
+        result: Future[bool] = Future()
+
+        @callback
+        def change_source() -> None:
+            if not result.set_running_or_notify_cancel():
+                return
+            try:
+                for listener in tuple(
+                    self._stream_source_listeners.get(serial_number, ())
+                ):
+                    listener()
+                close_consumers()
+            except Exception as err:
+                result.set_exception(err)
+            else:
+                result.set_result(True)
+
+        try:
+            self.hass.loop.call_soon_threadsafe(change_source)
+            return result.result(timeout=5)
+        except Exception as err:
+            # Cancel a callback still waiting on a stopped/busy event loop;
+            # it must not later close consumers belonging to another attempt.
+            result.cancel()
+            _LOGGER.warning("Could not reopen stream for %s: %s", serial_number, err)
+            return False
+
     def stop_streams(self) -> None:
         """Stop every live stream bridge owned by this coordinator."""
         self._stream_manager.stop_all()
@@ -1063,27 +1187,25 @@ class CloudEdgeCoordinator(DataUpdateCoordinator):
                 except OSError as e:
                     _LOGGER.warning("Failed to remove cache file %s: %s", cache_file, e)
 
-    async def async_safe_first_refresh(self) -> bool:
-        """Perform first refresh with safety handling."""
+    async def async_safe_first_refresh(self) -> None:
+        """Perform the first refresh; failures go back to Home Assistant.
+
+        A failed refresh raises ConfigEntryNotReady (ConfigEntryAuthFailed
+        when the credentials are rejected), so Home Assistant retries the
+        setup with its own backoff (5 s, 10 s, 20 s, ...). Swallowing it
+        loaded an entry without entities until the next poll, up to 60 min
+        later. The authentication check that precedes this can pass offline
+        with a cached session, so this is often the first network failure.
+        """
+        _LOGGER.info("Performing initial CloudEdge data fetch...")
         try:
             # Give a bit more time for initial setup
-            _LOGGER.info("Performing initial CloudEdge data fetch...")
             await asyncio.wait_for(
                 self.async_config_entry_first_refresh(),
                 timeout=90.0  # 90 seconds for initial setup
             )
-            _LOGGER.info("Initial CloudEdge setup completed successfully")
-            return True
-        except asyncio.TimeoutError:
-            _LOGGER.warning("Initial refresh timed out - will retry on next cycle")
-            return False
-        except asyncio.CancelledError:
-            raise
-        except ConfigEntryAuthFailed:
-            # Never downgrade an authentication failure to a best-effort first
-            # refresh: Home Assistant needs this exception to show reauth in
-            # Settings.
-            raise
-        except Exception as e:
-            _LOGGER.error("First refresh failed: %s - will retry on next cycle", e)
-            return False
+        except asyncio.TimeoutError as err:
+            raise ConfigEntryNotReady(
+                "Initial CloudEdge data fetch timed out"
+            ) from err
+        _LOGGER.info("Initial CloudEdge setup completed successfully")
