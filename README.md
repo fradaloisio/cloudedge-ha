@@ -35,6 +35,18 @@ This ensures that your main account remains logged in on your phone while the in
 
 ## Installation
 
+Home Assistant 2025.12 or newer is required: live streaming relies on the PyAV
+release that Home Assistant ships from that version on.
+
+If Home Assistant runs with an `http_proxy` environment variable, add
+`127.0.0.1` to the lowercase `no_proxy` variable. Without it, the HLS live
+view, live still images and recordings fail, and the proxy receives the
+camera's local stream URL, secret included; the WebRTC live view is not
+affected. Home Assistant opens that URL with FFmpeg, which reads only the
+lowercase variables and compares `no_proxy` entries with the host name, so
+`localhost` or `127.0.0.0/8` does not cover `127.0.0.1`. The integration logs
+a warning when it detects this setup.
+
 ### Method 1: HACS (Recommended)
 
 1. Open HACS in Home Assistant
@@ -82,18 +94,126 @@ AAC mono audio.
 
 Each camera also exposes a **Stream profile** select entity:
 
-- `Auto`: starts with the camera's advertised default (including adaptive
-  stream `105` when supported) and switches to the lowest-resolution profile
-  if the live stream is degraded.
-- `HD`: uses the camera's advertised main/high-quality stream.
-- `SD`: uses the camera's advertised lowest-resolution stream.
+- `Auto`: starts with the camera's own default stream, the one the CloudEdge
+  app opens (adaptive stream `105` when supported). If the live stream is
+  degraded it falls back to the `SD` stream, but only when that stream is
+  lighter: a camera whose default already is its smallest profile stays on it.
+- `HD`: uses the adaptive stream when supported, otherwise the camera's
+  largest advertised resolution.
+- `SD`: uses the camera's smallest advertised resolution, never larger than
+  `HD`.
+
+Some battery cameras advertise their smallest profile first. Earlier versions
+treated that first profile as the main stream, so on those cameras `HD` and
+`SD` were swapped and a degraded `Auto` stream moved to the largest one.
 
 Depending on the model these choices map to legacy IDs `0/1` or to modern
-profile IDs `100`–`105`. The active and available IDs are shown in the camera
+profile IDs `100`–`105`; a camera with a single available stream uses it for
+every choice. The active and available IDs are shown in the camera
 diagnostic attributes.
 
 Use `HD` when you want the best quality and the connection is stable. Use `SD`
 when the stream is choppy, stalls, or the camera is on a slower connection.
+
+Stream diagnostics report `streaming` only after a usable video keyframe arrives.
+If a connection is established but produces no video, the integration retries
+with a bounded recovery window. After four attempts in a row without video,
+automatic retries pause for 60 seconds, doubling with each further failed
+attempt up to 10 minutes; `stream_state` then reads `retry_cooldown` and
+`stream_retry_cooldown` shows the seconds left. Changing the Stream profile
+ends the pause; once video arrives again, a later pause starts again from 60
+seconds. Changing profiles reopens
+the decoder when the video format changes. Battery-camera wake time and
+live-view limits still depend on the device.
+
+After a short network pause the live video catches up with about one second
+of fast-forward instead of staying behind; during a longer pause, such as a
+battery camera reconnecting, the last keyframe stays on screen, and video
+resumes from the camera's next keyframe.
+
+Opening the live view no longer changes any camera setting. Earlier versions
+turned IoT parameter `167` on for each live view and off afterwards; on
+floodlight cameras that parameter is the front light switch, so viewing could
+switch the light and overwrite its setting. The `stream_live_switch` diagnostic
+attribute has been removed.
+
+Earlier versions exposed the camera's P2P secrets: `host_key` in the attributes
+of the `Status` sensor (`sensor.<device>_status`), and the P2P credentials in
+the log and in the `cloudedge_device_info` event of the
+`cloudedge.get_device_info` service. The attribute has been removed, the
+service output is redacted, and the secret IoT parameters `3`, `21` and `217`
+(device key, safe password, video password) no longer become sensors. Updating
+does not remove what the recorder already stored, nor what backups made before
+the update contain: purge the history of those
+`Status` sensors, and of any `Device key`, `Safe password` or `Video password`
+sensor you had enabled, with `recorder.purge_entities`, then delete the
+leftover secret sensors. Old `cloudedge_device_info` events expire with the
+recorder history (10 days by default); to remove them now, exclude that event
+type (`exclude: event_types`) in the `recorder` configuration and run
+`recorder.purge` with `apply_filter: true`. Treat logs you have already shared
+as compromised (earlier versions also logged the service output at INFO level),
+and pair the camera again if you published them.
+
+## Status, snapshots and startup
+
+- The `Connection Status` sensor follows the CloudEdge cloud status: a
+  sleeping battery camera reads `dormancy`. Earlier versions showed `offline`
+  for sleeping cameras from the second refresh on, so automations triggered by
+  `offline` could fire while a camera was only asleep. The integration no
+  longer pings cameras on the local network.
+- While a live view is streaming, the camera's still image (dashboard cards,
+  notifications through `/api/camera_proxy`) is the current live frame.
+  Otherwise it remains the last alarm snapshot or the product picture: a still
+  image never starts a stream, so it does not wake a sleeping camera.
+- Camera attributes such as `battery_percent`, `wifi_strength` and
+  `motion_det_enable` are now published; earlier versions never showed them.
+- The `cloudedge_device_info` event of `cloudedge.get_device_info` now
+  includes the device configuration, and an alarm snapshot no longer makes the
+  recorder drop the event.
+- If CloudEdge cannot be reached when Home Assistant starts, Home Assistant
+  retries the integration's setup after 5, 10, 20 seconds and so on, up to
+  every 10 minutes. Earlier versions loaded without entities and waited for
+  the next refresh interval.
+
+## Development and streaming tests
+
+Use Python 3.14 and install `requirements-dev.txt`. Media regression tests also
+need an `ffmpeg` executable with H.264, HEVC and AAC support. The tests generate
+their own video and do not require camera credentials:
+
+```sh
+python -m pip install -r requirements-dev.txt
+python -m pytest tests/ -p no:cacheprovider
+```
+
+CI also runs the suite on Home Assistant 2025.12.0, the minimum declared in
+`hacs.json`, with Python 3.13 and the stream requirements of that release (see
+`.github/workflows/ci.yml`). Raise both together.
+
+When testing changes in both repositories, install the corresponding local
+`pycloudedge` checkout in this development environment, or place it on
+`PYTHONPATH`. Release the library before updating the pinned version in both
+`manifest.json` and `requirements-dev.txt`.
+
+### Test with Docker
+
+Keep the `pycloudedge` checkout next to this repository. The development Compose
+uses Home Assistant 2026.9.4, mounts this integration directly, and installs the
+adjacent library's current source at each container start. Its local package
+version matches the integration manifest so HA retains the development build.
+Account settings and recordings stay in the ignored `ha-config/` directory.
+
+```sh
+cd cloudedge-ha
+docker compose up -d --force-recreate
+docker compose logs -f homeassistant
+```
+
+Open `http://localhost:8123`. After editing either checkout, use
+`docker compose restart homeassistant` to reload both. The Compose file preserves
+host networking for the P2P transport; on macOS it uses the Docker VM's network.
+With Colima, port forwarding must expose the VM's port 8123 to the host. Stop the
+test environment with `docker compose down` (the configuration directory remains).
 
 ## Automation Examples
 

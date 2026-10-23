@@ -3,5 +3,5 @@
   "hacs": "1.6.0",
   "hide_default_branch": true,
   "iot_class": "cloud_push",
-  "homeassistant": "2023.1.0"
+  "homeassistant": "2025.12.0"
 }

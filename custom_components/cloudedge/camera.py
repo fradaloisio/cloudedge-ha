@@ -1,6 +1,7 @@
 """Camera platform for CloudEdge integration."""
 from __future__ import annotations
 
+import dataclasses
 import io
 import logging
 import time
@@ -137,6 +138,44 @@ class CloudEdgeCamera(
         self._attr_name = device_info.get("name", f"Camera {serial_number}")
         self._last_image: bytes | None = None
 
+    async def async_added_to_hass(self) -> None:
+        """Reopen the decoder before the bridge closes an obsolete format."""
+        await super().async_added_to_hass()
+        self.async_on_remove(
+            self.coordinator.async_add_stream_source_listener(
+                self._serial_number, self._async_stream_source_changed
+            )
+        )
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Stop this entity's HA Stream: HA core does not do it on removal."""
+        stream, self.stream = self.stream, None
+        if stream is not None:
+            # Stream.stop() keeps a preloaded worker running, so clear the
+            # flag on a copy: HA shares one settings object per entity_id
+            # with the camera preferences and the entity's next Stream, and
+            # clearing it in place turned "Preload stream" off until restart.
+            # Run stop() in the background: the worker join can last until
+            # the bridge ends the worker's connection to its source.
+            stream.dynamic_stream_settings = dataclasses.replace(
+                stream.dynamic_stream_settings, preload_stream=False
+            )
+            self.hass.async_create_background_task(
+                stream.stop(), f"{DOMAIN} stop stream {self._serial_number}"
+            )
+        await super().async_will_remove_from_hass()
+
+    @callback
+    def _async_stream_source_changed(self) -> None:
+        # Fast-restart only a worker that is serving a viewer. During HA's
+        # retry backoff (available is False), or once stop() has removed the
+        # outputs, update_source() would end the worker loop or leave
+        # _fast_restart_once latched, turning a later stop() into a restart
+        # that never finishes. Ending the old source alone is safe there.
+        stream = self.stream
+        if stream is not None and stream.available and stream.outputs():
+            stream.update_source(stream.source)
+
     @property
     def available(self) -> bool:
         """Return if camera is available."""
@@ -172,15 +211,17 @@ class CloudEdgeCamera(
 
         # Add configuration parameters if available
         if config := device_data.get("configuration"):
-            for param_name, param_info in config.items():
-                if param_name in [
+            # Configuration is keyed by numeric IoT code; match on the name.
+            for param_info in config.values():
+                param_name = (param_info or {}).get("name")
+                if param_name in (
                     "DEVICE_RESOLUTION",
-                    "WIFI_STRENGTH", 
+                    "WIFI_STRENGTH",
                     "BATTERY_PERCENT",
                     "MOTION_DET_ENABLE",
                     "FRONT_LIGHT_SWITCH",
                     "LED_ENABLE",
-                ]:
+                ):
                     attributes[param_name.lower()] = param_info.get("formatted", param_info.get("value"))
 
         alarm_ts = device_data.get("last_alarm_time")
@@ -198,7 +239,11 @@ class CloudEdgeCamera(
         return attributes
 
     async def stream_source(self) -> str | None:
-        """Return a local TCP MPEG-TS stream for Home Assistant."""
+        """Return the bridge's local MPEG-TS source: an HTTP URL with a secret.
+
+        Home Assistant's stream worker and go2rtc open it; any other request
+        to the bridge's loopback port is refused.
+        """
         return await self.coordinator.async_get_stream_source(self._serial_number)
 
     async def async_turn_on(self) -> None:
@@ -263,6 +308,25 @@ class CloudEdgeCamera(
             return _render_stream_loading_gif()
 
         self.content_type = "image/jpeg"
+
+        # While a live session is already running, use HA's keyframe
+        # converter. Never start or restart a stream from here:
+        # Stream.async_get_image() calls start(), and a dashboard poll would
+        # then wake a sleeping battery camera every few seconds.
+        stream = self.stream
+        if (
+            stream is not None
+            and stream_state == "streaming"
+            and self.coordinator.is_device_streaming(self._serial_number)
+            and stream.outputs()
+        ):
+            try:
+                live = await stream.async_get_image(width=width, height=height)
+            except Exception as err:  # noqa: BLE001 - fall back to stills
+                _LOGGER.debug("Live still failed for %s: %s", self._attr_name, err)
+                live = None
+            if live:
+                return live
 
         device_data = (
             self.coordinator.data.get(self._serial_number)

@@ -1,20 +1,30 @@
 """Regressions for stream teardown and diagnostics responsiveness (F01/F05).
 
-Both tests use real local processes/sockets with deterministic blocking
+The tests use real local processes/sockets with deterministic blocking
 primitives, and guarantee cleanup in `finally` so no child process or
 socket survives a failure.
 """
+import os
 import socket
+import stat
 import subprocess
+import sys
 import threading
 import time
+import uuid
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 
 pytest.importorskip("homeassistant")
 
-from custom_components.cloudedge.stream_bridge import CloudEdgeStreamBridge
+from custom_components.cloudedge import stream_bridge as module
+from custom_components.cloudedge.stream_bridge import (
+    CloudEdgeStreamBridge,
+    CloudEdgeStreamManager,
+)
 
 
 def make_bridge():
@@ -118,8 +128,10 @@ class BlockingSendSocket(socket.socket):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._release = threading.Event()
+        self.entered = threading.Event()
 
     def sendall(self, data, flags=0):
+        self.entered.set()
         self._release.wait(timeout=30)
         return socket.socket.sendall(self, data, flags)
 
@@ -148,14 +160,12 @@ def test_diagnostics_stay_responsive_while_a_client_writer_is_stalled():
         broadcast_done.set()
 
     try:
-        with bridge._stream_clients_lock:
-            bridge._stream_clients.append(client)
+        bridge._register_stream_client(client)
 
         broadcaster = threading.Thread(target=broadcast, daemon=True)
         broadcaster.start()
-        # Give the broadcaster time to enter the blocked sendall.
-        time.sleep(0.2)
-        assert not broadcast_done.is_set(), "expected the writer to be blocked"
+        assert client.entered.wait(5), "expected the consumer writer to be blocked"
+        assert broadcast_done.wait(1), "producer waited for a slow consumer"
 
         started = time.monotonic()
         assert bridge.client_count == 1
@@ -197,17 +207,30 @@ def test_broadcast_removes_dead_clients_without_losing_good_ones():
 
     try:
         dead = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        with bridge._stream_clients_lock:
-            bridge._stream_clients.extend([client, good, dead])
+        for sock in (client, good, dead):
+            bridge._register_stream_client(sock)
         dead.close()  # already closed peer socket
 
         client.release()
         bridge._broadcast_stream(b"data")
 
-        with bridge._stream_clients_lock:
-            # The live client (released) and the good one survive in order;
-            # only the dead socket is dropped.
-            assert bridge._stream_clients == [client, good]
+        good_peer.settimeout(3)
+        peer.settimeout(3)
+        assert good_peer.recv(4) == b"data"
+        assert peer.recv(4) == b"data"
+
+        # The dead client's writer unregisters it, asynchronously. Read the
+        # registry itself: client_count prunes closed sockets on its own and
+        # would hide a writer that never unregistered its client.
+        def registered():
+            with bridge._stream_clients_lock:
+                return set(bridge._stream_clients), set(bridge._stream_consumers)
+
+        live = {client, good}
+        deadline = time.monotonic() + 3
+        while registered() != (live, live) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert registered() == (live, live)
     finally:
         for sock in (client, peer, good, good_peer):
             try:
@@ -215,3 +238,140 @@ def test_broadcast_removes_dead_clients_without_losing_good_ones():
             except OSError:
                 pass
         bridge.stop("manager_stop")
+
+
+# ── C08: Home Assistant stop must leave no session or FIFO behind ─────────
+
+def test_stop_all_waits_for_closing_sessions_but_not_for_a_stuck_one(monkeypatch):
+    """HA exits right after stop_streams() and the bridge threads are daemons:
+    each P2P session needs time to close (logout, sockets), yet one stuck in
+    network I/O must not hold up the unload or the shutdown."""
+    monkeypatch.setattr(module, "_STOP_JOIN_TIMEOUT", 1.0, raising=False)
+    entered = {"closing": threading.Event(), "stuck": threading.Event()}
+    closed = threading.Event()
+    release = threading.Event()
+
+    def create_streamer(device, on_video, on_audio, on_login, on_disconnect,
+                        video_id, manage_stream_switch=True):
+        serial = device["serial_number"]
+        stop_requested = threading.Event()
+        streamer = Mock(_cloudedge_native_signaling_retry=True)
+        streamer.request_stop.side_effect = stop_requested.set
+
+        def run():
+            entered[serial].set()
+            if serial == "stuck":
+                release.wait(10)  # blocked in I/O, deaf to request_stop()
+            else:
+                stop_requested.wait(10)
+                time.sleep(0.3)  # the SDK logs out and closes its sockets
+                closed.set()
+            return 0, 0
+
+        streamer.run_session.side_effect = run
+        return streamer
+
+    coordinator = SimpleNamespace(
+        client=SimpleNamespace(create_streamer=create_streamer),
+        get_device_for_stream=lambda serial: {
+            "serial_number": serial, "device_id": serial, "type_id": 1,
+        },
+        notify_stream_state_changed=lambda: None,
+    )
+    manager = CloudEdgeStreamManager(coordinator)
+    workers = []
+    try:
+        for serial in entered:
+            bridge = manager.get_bridge(serial)
+            bridge._stream_server = Mock()  # the local listener HA opened
+            monkeypatch.setattr(bridge, "_kick_prewake", lambda: None)
+            monkeypatch.setattr(bridge, "_wait_for_prewake", lambda: True)
+            monkeypatch.setattr(bridge, "_should_keep_running", lambda: True)
+            monkeypatch.setattr(bridge, "_idle_watch_loop", lambda _: None)
+            assert bridge._ensure_pipeline_started()
+            workers.append(bridge._worker_thread)
+        assert all(event.wait(5) for event in entered.values())
+
+        started = time.monotonic()
+        manager.stop_all()
+        elapsed = time.monotonic() - started
+
+        assert closed.is_set(), "stop_all() returned before the session closed"
+        assert elapsed < 3.0, f"a stuck session held stop_all() for {elapsed:.1f}s"
+    finally:
+        release.set()
+        manager.stop_all()
+        for worker in workers:
+            worker.join(5)
+    assert not any(worker.is_alive() for worker in workers)
+
+
+def test_audio_fifo_left_by_a_killed_process_does_not_disable_audio():
+    """HA can die mid-stream (daemon threads never clean up). Its FIFO must not
+    collide with the next process's: 'File exists' meant a muxer without audio."""
+    script = (
+        "import sys\n"
+        "from types import SimpleNamespace\n"
+        "from custom_components.cloudedge.stream_bridge import CloudEdgeStreamBridge\n"
+        "print(CloudEdgeStreamBridge(SimpleNamespace(), sys.argv[1])._prepare_audio_fifo())\n"
+    )
+    serial = f"fifo-{uuid.uuid4().hex[:8]}"
+    paths = []
+    try:
+        for _ in range(2):  # the same camera in two HA processes; no cleanup
+            result = subprocess.run(
+                [sys.executable, "-c", script, serial],
+                cwd=Path(__file__).parents[1],
+                capture_output=True, text=True, timeout=60, check=True,
+            )
+            paths.append(result.stdout.strip().splitlines()[-1])
+        assert "None" not in paths, f"audio disabled: {result.stderr.strip()}"
+        assert paths[0] != paths[1]
+    finally:
+        for path in paths:
+            if path != "None":
+                CloudEdgeStreamBridge._cleanup_audio_fifo(path)
+
+
+def test_audio_fifo_directory_is_private_and_removed_with_the_fifo():
+    bridge = make_bridge()
+    first, second = bridge._prepare_audio_fifo(), bridge._prepare_audio_fifo()
+    try:
+        assert first and second
+        for path in (first, second):
+            assert stat.S_ISFIFO(os.stat(path).st_mode)
+            # Other local users can neither open nor pre-create it.
+            assert stat.S_IMODE(os.stat(os.path.dirname(path)).st_mode) == 0o700
+        # Both cleanup paths: the audio writer once FFmpeg has exited, and stop().
+        bridge._audio_writer(SimpleNamespace(poll=lambda: 0), first)
+        bridge._running = True
+        bridge._audio_fifo_path = second
+        bridge.stop("manager_stop")
+        leftovers = [
+            entry
+            for path in (first, second)
+            for entry in (path, os.path.dirname(path))
+            if os.path.lexists(entry)
+        ]
+    finally:
+        for path in (first, second):
+            CloudEdgeStreamBridge._cleanup_audio_fifo(path)
+    assert leftovers == []
+
+
+def test_audio_fifo_directory_is_removed_when_the_fifo_cannot_be_created(monkeypatch, tmp_path):
+    """The muxer runs without audio, and its private directory is not leaked."""
+    attempts = []
+
+    def mkfifo(path, mode=0o666):
+        attempts.append(path)
+        raise OSError("FIFOs are not supported on this filesystem")
+
+    monkeypatch.setattr(module.tempfile, "tempdir", str(tmp_path))
+    monkeypatch.setattr(module.os, "mkfifo", mkfifo)
+
+    assert make_bridge()._prepare_audio_fifo() is None
+    # The FIFO was attempted inside a fresh private directory under tmp_path...
+    assert [Path(path).parent.parent for path in attempts] == [tmp_path]
+    # ...and that directory is gone.
+    assert list(tmp_path.iterdir()) == []

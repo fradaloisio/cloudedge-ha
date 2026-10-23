@@ -7,15 +7,44 @@ on:
 
 jobs:
   tests:
+    name: tests (Home Assistant ${{ matrix.homeassistant }})
     runs-on: ubuntu-latest
+    # A deadlocked stream test would otherwise hold the runner for 6 hours.
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The release pinned in requirements-dev.txt.
+          - homeassistant: "2026.9.4"
+            python-version: "3.14"
+          # The minimum declared in hacs.json, with the stream requirements it
+          # pins. pycares: 2025.12.3 constrains it, pycares 5 breaks aiodns.
+          - homeassistant: "2025.12.0"
+            python-version: "3.13"
+            pins: "av==16.0.1 numpy==2.3.2 PyTurboJPEG==1.8.0 pycares==4.11.0"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.14"
+          python-version: ${{ matrix.python-version }}
           cache: pip
           cache-dependency-path: requirements-dev.txt
       - name: Install dependencies
-        run: pip install -r requirements-dev.txt
+        env:
+          HA_VERSION: ${{ matrix.homeassistant }}
+          HA_PINS: ${{ matrix.pins }}
+        run: |
+          if [ -z "$HA_PINS" ]; then
+            pip install -r requirements-dev.txt
+          else
+            # Same test dependencies, under that release's package constraints.
+            pip install "homeassistant==$HA_VERSION"
+            constraints="$(python -c 'import homeassistant, pathlib; print(pathlib.Path(homeassistant.__file__).parent / "package_constraints.txt")')"
+            grep -v -E '^(homeassistant|av)==' requirements-dev.txt > "$RUNNER_TEMP/requirements-min.txt"
+            pip install -c "$constraints" -r "$RUNNER_TEMP/requirements-min.txt" $HA_PINS
+          fi
+      - name: Install media tools
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
       - name: Run tests
         run: python -m pytest tests/ -v

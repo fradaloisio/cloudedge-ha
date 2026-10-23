@@ -1,0 +1,79 @@
+# Local development only, not a deployment template: the container shares the
+# host network, which the P2P transport needs.
+services:
+  homeassistant:
+    container_name: homeassistant-cloudedge-test
+    image: homeassistant/home-assistant:2026.9.4
+    volumes:
+      - ./ha-config:/config
+      # Use this checkout's integration. From the adjacent library checkout,
+      # mount only what scripts/docker-start.py copies: its .env files hold
+      # account credentials and stay out of the container.
+      - type: bind
+        source: ./custom_components/cloudedge
+        target: /config/custom_components/cloudedge
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ../pycloudedge/cloudedge
+        target: /pycloudedge/cloudedge
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ../pycloudedge/pyproject.toml
+        target: /pycloudedge/pyproject.toml
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ../pycloudedge/setup.py
+        target: /pycloudedge/setup.py
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ../pycloudedge/README.md
+        target: /pycloudedge/README.md
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ../pycloudedge/LICENSE
+        target: /pycloudedge/LICENSE
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ../pycloudedge/requirements.txt
+        target: /pycloudedge/requirements.txt
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./scripts/docker-start.py
+        target: /opt/cloudedge-dev/start.py
+        read_only: true
+        bind:
+          create_host_path: false
+    restart: unless-stopped
+    network_mode: host
+    # pycloudedge reports a camera on the local network online only if it
+    # answers ping, which needs NET_RAW: Docker grants it by default, stricter
+    # runtimes may not.
+    cap_add:
+      - NET_RAW
+    environment:
+      TZ: Europe/Rome
+      PYTHONDONTWRITEBYTECODE: "1"
+    # Install the local library before the image's normal HA startup. Passing
+    # another command to `docker compose run` performs the same preparation.
+    entrypoint: ["python3", "/opt/cloudedge-dev/start.py"]
+    command: ["/init"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8123"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s

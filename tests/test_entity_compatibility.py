@@ -9,7 +9,9 @@ from homeassistant.helpers import entity_registry as er
 from custom_components.cloudedge import (
     binary_sensor, button, camera, select, sensor, switch,
 )
-from custom_components.cloudedge.const import DOMAIN, SWITCH_PARAMETERS, SENSOR_PARAMETERS
+from custom_components.cloudedge.const import (
+    DOMAIN, SECRET_PARAMETER_CODES, SWITCH_PARAMETERS, SENSOR_PARAMETERS,
+)
 from cloudedge.iot_parameters import IOT_PARAMETERS, BOOLEAN_PARAMETERS
 from conftest import load_empty_registries
 from test_coordinator import make_coordinator
@@ -130,9 +132,11 @@ def test_all_sensor_identities_match_the_legacy_schema(tmp_path):
         await sensor.async_setup_entry(hass, coordinator.config_entry, entities.extend)
         expected = {"cloudedge_sn_connection_status"}
         expected.update(f"cloudedge_sn_{name}" for name, code in SENSOR_PARAMETERS.items() if code in config)
+        # Device secrets never become sensors (test_secret_exposure.py).
         expected.update(
             f"cloudedge_sn_{info['name'].lower()}"
-            for code, info in IOT_PARAMETERS.items() if code not in SENSOR_PARAMETERS.values()
+            for code, info in IOT_PARAMETERS.items()
+            if code not in SENSOR_PARAMETERS.values() and code not in SECRET_PARAMETER_CODES
         )
         assert {e.unique_id for e in entities} == expected
         battery = next(e for e in entities if e.unique_id == "cloudedge_sn_battery_level")

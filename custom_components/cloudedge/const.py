@@ -238,6 +238,15 @@ ENABLED_BY_DEFAULT_SENSOR_PARAMS = [
     "154",   # BATTERY_PERCENT - Battery percentage (diagnostic)
 ]
 
+# Parameter codes holding device secrets. They never become entities (states
+# are readable by every HA user and kept by the recorder) and are redacted
+# from service output.
+SECRET_PARAMETER_CODES = frozenset({
+    "3",    # DEVICE_KEY
+    "21",   # SAFE_PASSWORD
+    "217",  # VIDEO_PASSWORD
+})
+
 # Parameter names that should be enabled by default for switches (CONFIG)
 ENABLED_BY_DEFAULT_SWITCH_PARAMS = [
     "MOTION_DET_ENABLE",  # Motion detection enable (config)

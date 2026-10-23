@@ -78,6 +78,9 @@ async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> dict[str,
                 phone_code=phone_code,
                 debug=False,  # pycloudedge debug dumps raw API traffic (tokens) to logs
                 session_cache_file=tmp_cache,
+                # Only the device count is needed: no config read and LAN
+                # ping per device (the coordinator never pings either).
+                enable_network_ping=False,
             )
             if not client.authenticate():
                 raise InvalidAuth("Authentication failed")
