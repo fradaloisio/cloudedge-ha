@@ -11,7 +11,7 @@ Changes:
 - Retry setup after temporary cloud failures and support accounts with owned/default and shared homes.
 - Remove P2P secrets from entity attributes, service events and logs. Opening live view no longer changes the floodlight setting.
 
-Requirements: Home Assistant 2025.12.0 or newer. Restart Home Assistant after updating.
+Requirements: Home Assistant 2026.9.4 or newer. Restart Home Assistant after updating.
 
 Security note: upgrading does not erase secrets stored by earlier versions in recorder history, backups or shared logs. Follow the cleanup guidance in the README if affected.
 

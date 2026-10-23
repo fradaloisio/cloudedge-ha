@@ -35,8 +35,8 @@ This ensures that your main account remains logged in on your phone while the in
 
 ## Installation
 
-Home Assistant 2025.12 or newer is required: live streaming relies on the PyAV
-release that Home Assistant ships from that version on.
+Home Assistant 2026.9.4 or newer is required: it is the release CI tests, and
+live streaming relies on the PyAV version it ships.
 
 If Home Assistant runs with an `http_proxy` environment variable, add
 `127.0.0.1` to the lowercase `no_proxy` variable. Without it, the HLS live
@@ -186,9 +186,9 @@ python -m pip install -r requirements-dev.txt
 python -m pytest tests/ -p no:cacheprovider
 ```
 
-CI also runs the suite on Home Assistant 2025.12.0, the minimum declared in
-`hacs.json`, with Python 3.13 and the stream requirements of that release (see
-`.github/workflows/ci.yml`). Raise both together.
+CI runs the suite on the Home Assistant release pinned in
+`requirements-dev.txt`, which is also the minimum declared in `hacs.json`.
+Raise both together.
 
 When testing changes in both repositories, install the corresponding local
 `pycloudedge` checkout in this development environment, or place it on
