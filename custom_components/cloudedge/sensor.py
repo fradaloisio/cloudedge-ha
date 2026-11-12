@@ -197,7 +197,9 @@ class CloudEdgeConfigSensor(CloudEdgeBaseSensor):
         elif param_name in ["motion_sensitivity", "speaker_volume", "microphone_volume"]:
             self._attr_native_unit_of_measurement = PERCENTAGE
             self._attr_state_class = SensorStateClass.MEASUREMENT
-            self._attr_entity_category = EntityCategory.CONFIG
+            # Read-only settings: Home Assistant refuses a sensor in the
+            # config category as soon as it is enabled.
+            self._attr_entity_category = EntityCategory.DIAGNOSTIC
         else:
             self._attr_entity_category = EntityCategory.DIAGNOSTIC
 
