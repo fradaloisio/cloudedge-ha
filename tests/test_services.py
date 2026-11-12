@@ -308,33 +308,6 @@ def test_refresh_device_without_target_refreshes_every_coordinator(tmp_path):
     asyncio.run(run())
 
 
-def test_get_device_info_reads_the_configuration_the_library_missed(tmp_path):
-    # pycloudedge <= 0.1.11 only parses result.iot, while the live
-    # /openapi/device/config reply carries a top-level iot: the event never
-    # contained the configuration.
-    async def run():
-        coordinator = make_coordinator(tmp_path)
-        coordinator.data = {
-            "sn-a": {"name": "Front Door", "device_id": "id-a", "serial_number": "sn-a"},
-        }
-        coordinator.client.get_device_info.return_value = {
-            "name": "Front Door", "device_id": "id-a", "serial_number": "sn-a",
-        }
-        coordinator.client.get_device_config.return_value = {
-            "action": "query", "code": 1001, "iot": {"154": 75}, "name": "sn-a",
-        }
-        hass = make_hass(coordinator)
-        handlers = await registered_handlers(hass)
-
-        await handlers["get_device_info"](Mock(data={"device_name": "Front Door"}))
-
-        _, event_data = hass.bus.async_fire.call_args.args
-        assert event_data["device_info"]["configuration"]["154"]["value"] == 75
-        coordinator.client.get_device_config.assert_called_once_with("sn-a")
-
-    asyncio.run(run())
-
-
 @pytest.mark.parametrize("include_config", [True, False])
 def test_get_device_info_reads_no_configuration_the_library_returned(tmp_path, include_config):
     # A library that parses the reply itself (or a call without

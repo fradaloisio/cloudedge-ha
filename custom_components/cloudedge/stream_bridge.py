@@ -56,8 +56,6 @@ _FAILED_SESSION_COOLDOWN_MAX = 600.0
 _WAKE_RETRY_COOLDOWN = 15.0
 _PREWAKE_RESULT_TTL = 30.0
 _ONLINE_GRACE_WINDOW = 20.0
-_SIGNAL_STATUS_RETRY_WINDOW = 8.0
-_SIGNAL_STATUS_RETRY_POLL = 1.0
 _MAX_MPEGTS_BOOTSTRAP_BYTES = 4 * 1024 * 1024
 # A local consumer sends its HTTP request as soon as it connects (FFmpeg in
 # HA's stream worker, go2rtc). Each connection is answered on its own thread,
@@ -1594,148 +1592,6 @@ class CloudEdgeStreamBridge:
         self._active_video_id = selected
         return selected
 
-    def _resolve_signaling_server_for_api(self, api) -> tuple[str, int]:
-        """Resolve the signaling host from the account region."""
-        candidates: list[tuple[str, int]] = []
-        openapi_base = getattr(api, "OPENAPI_BASE_URL", "")
-        openapi_host = urlparse(openapi_base).hostname or ""
-        if (
-            openapi_host.startswith("openapi-")
-            and openapi_host.endswith(".mearicloud.com")
-        ):
-            signaling_host = openapi_host[len("openapi-"):]
-            candidates.append((signaling_host, 28974))
-            candidates.append((signaling_host, 9253))
-
-        candidates.extend(
-            [
-                ("euce.mearicloud.com", 28974),
-                ("47.254.142.96", 28974),
-            ]
-        )
-
-        seen: set[tuple[str, int]] = set()
-        for host, port in candidates:
-            if (host, port) in seen:
-                continue
-            seen.add((host, port))
-            try:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(2.0)
-                sock.connect((host, port))
-                sock.close()
-                return (host, port)
-            except (socket.timeout, ConnectionRefusedError, OSError):
-                continue
-
-        return candidates[0]
-
-    def _patch_streamer_status_retry(self, streamer) -> None:
-        """Retry P2P signaling status when OpenAPI already says online.
-
-        Some cameras briefly report ``offline`` on the signaling channel even
-        after ``get_device_online_status()`` has switched to ``online``. In
-        that window the stock streamer aborts too early.
-        """
-        if getattr(streamer, "_cloudedge_status_retry_patch", False):
-            return
-
-        original_do_stream = streamer._do_stream
-        original_on_disconnect = streamer.on_disconnect
-
-        def _do_stream_with_status_retry(sig):
-            original_query_status = sig.query_device_status
-
-            def _query_status_with_retry(device_uuid):
-                status = original_query_status(device_uuid)
-                if status.get("status") != "offline":
-                    return status
-
-                api = getattr(streamer, "_api", None)
-                serial_number = getattr(streamer, "_sn_num", None) or self._serial_number
-                if api is None or not hasattr(api, "get_device_online_status"):
-                    return status
-
-                try:
-                    api_status = api.get_device_online_status(serial_number)
-                except Exception as err:
-                    _LOGGER.debug(
-                        "OpenAPI status recheck failed for %s during P2P startup: %s",
-                        serial_number,
-                        err,
-                    )
-                    return status
-
-                if api_status != "online":
-                    return status
-
-                _LOGGER.debug(
-                    "Signaling status is offline for %s while OpenAPI is online; "
-                    "retrying signaling status for %.0fs",
-                    serial_number,
-                    _SIGNAL_STATUS_RETRY_WINDOW,
-                )
-                deadline = time.monotonic() + _SIGNAL_STATUS_RETRY_WINDOW
-                while time.monotonic() < deadline and getattr(streamer, "_running", False):
-                    time.sleep(_SIGNAL_STATUS_RETRY_POLL)
-                    retry_status = original_query_status(device_uuid)
-                    retry_name = retry_status.get("status", "unknown")
-                    if retry_name != "offline":
-                        _LOGGER.debug(
-                            "Signaling status recovered for %s: %s",
-                            serial_number,
-                            retry_name,
-                        )
-                        return retry_status
-
-                return status
-
-            sig.query_device_status = _query_status_with_retry
-            return original_do_stream(sig)
-
-        def _run_session_with_region_signaling():
-            from cloudedge.p2p.meari_signaling import MsgSvrClient
-
-            streamer._running = True
-            streamer._video_count = 0
-            streamer._total_bytes = 0
-
-            sig = None
-            try:
-                sig_host, sig_port = self._resolve_signaling_server_for_api(streamer._api)
-                _LOGGER.debug(
-                    "Connecting to signaling %s:%d for %s",
-                    sig_host,
-                    sig_port,
-                    self._serial_number,
-                )
-                sig = MsgSvrClient(sig_host, sig_port)
-                sig.connect()
-
-                video_count, total_bytes = streamer._do_stream(sig)
-                streamer._video_count = video_count
-                streamer._total_bytes = total_bytes
-                return (video_count, total_bytes)
-            except Exception as err:
-                _LOGGER.error("P2P session error: %s", err)
-                return (streamer._video_count, streamer._total_bytes)
-            finally:
-                if sig:
-                    try:
-                        sig.send_logout(streamer._device_uuid)
-                    except Exception:
-                        pass
-                    sig.close()
-                if original_on_disconnect:
-                    try:
-                        original_on_disconnect()
-                    except Exception:
-                        pass
-
-        streamer._do_stream = _do_stream_with_status_retry
-        streamer.run_session = _run_session_with_region_signaling
-        streamer._cloudedge_status_retry_patch = True
-
     def _stream_worker(self, gen: int) -> None:
         consecutive_failures = 0
         device: dict | None = None
@@ -2000,12 +1856,6 @@ class CloudEdgeStreamBridge:
                         video_id,
                         self._serial_number,
                     )
-                    if not getattr(
-                        streamer,
-                        "_cloudedge_native_signaling_retry",
-                        False,
-                    ):
-                        self._patch_streamer_status_retry(streamer)
                     streamer.run_session()
                 except Exception as err:
                     with self._metrics_lock:
