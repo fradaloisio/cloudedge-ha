@@ -93,12 +93,12 @@ _MUXER_QUICK_EXITS = 3
 # frame interval is at most 1/_PACER_MIN_FPS), then every _KEEPALIVE_INTERVAL.
 _KEEPALIVE_GAP = 2.0
 _KEEPALIVE_INTERVAL = 1.0
-# The hold spans a battery camera's reconnect after its ~2 min live window:
-# pycloudedge notices the stall after ~50 s, the bridge waits
-# _RECONNECT_COOLDOWN (8 s), and the next window's first video may take up to
-# the library's 30 s first-video timeout (~10 s observed). 50 + 8 + 30 = 88 s.
-# Past the hold the camera is gone, and HA's stream reports it.
-_KEEPALIVE_MAX_HOLD = 90.0
+# The hold spans a battery camera's reconnect after a live window that the
+# camera ended on its own: pycloudedge ends the silent session within 35 s
+# (~31 s observed), the bridge waits _RECONNECT_COOLDOWN (8 s), and the next
+# window's first video takes ~10 s. 35 + 8 + 10 = 53 s. Past the hold the
+# camera is gone, and HA's stream reports it after its own source timeout.
+_KEEPALIVE_MAX_HOLD = 60.0
 # Shared by every bridge when the integration stops: time for each P2P session
 # to finish its own teardown before Home Assistant exits (the bridge threads
 # are daemons and would simply vanish).
