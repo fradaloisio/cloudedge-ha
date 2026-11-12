@@ -67,6 +67,20 @@ a warning when it detects this setup.
    ```
 3. Restart Home Assistant
 
+## Configuration
+
+After the restart, go to **Settings → Devices & services → Add integration**,
+search for **CloudEdge** and enter the account's email, password and country.
+
+To change the options later, open the CloudEdge integration there and select
+**Configure**. Saving a change reloads the integration.
+
+| Option | Default | Effect |
+| --- | --- | --- |
+| Refresh interval | 5 minutes | How often device status and settings are read from the cloud. |
+| Battery cameras: maximum live view time | 10 minutes | A battery camera's live view stops after this time and the camera rests (see [Battery cameras](#battery-cameras)). `0` removes the limit. |
+| Battery cameras: keep streaming while someone is watching | On | Off lets the camera end each live window on its own after about 2 minutes; the picture then freezes for up to a minute while the next window opens. |
+| Camera audio in live streams | On | Off gives a video-only stream, for example if playback stalls. |
 
 ## Enable Debug Logging
 
@@ -85,12 +99,35 @@ Then restart Home Assistant and check the logs for detailed information.
 ## Live Streaming
 
 Supported cameras expose a Home Assistant `camera.*` entity with experimental
-live streaming. Battery-powered CloudEdge cameras wake only for finite live-view
-windows, so the stream may reconnect when the camera goes back to sleep. While
-Home Assistant waits, the camera snapshot shows a language-neutral animated
-loading indicator.
+live streaming. A battery-powered camera is woken for the live view, which
+takes a few seconds. While Home Assistant waits, the camera snapshot shows a
+language-neutral animated loading indicator.
 Incoming G.711 camera audio is included in the live stream as browser-compatible
-AAC mono audio.
+AAC mono audio, unless it is turned off in the options.
+
+### Battery cameras
+
+A battery camera stays awake, and streams, for as long as a viewer is
+connected. A dashboard card left open on a tablet counts as a viewer, and so
+does Home Assistant's **Preload camera stream** setting, which keeps the
+stream open with nobody watching. Either can drain the battery in hours.
+
+To limit the damage:
+
+- A battery camera's live view stops after 10 minutes (the *maximum live view
+  time* option). The camera then rests for 1 minute. If the same viewer is
+  still connected and the limit is reached again, the rest doubles each time,
+  up to 1 hour. While the camera rests, `stream_state` reads `live_limit` and
+  `stream_live_limit_rest` shows the seconds left; Home Assistant's stream
+  errors in the log during a rest are expected.
+- A view that ends because the viewers left, or a change of the Stream
+  profile, starts again from the 1 minute rest. Changing the Stream profile
+  also ends a rest in progress.
+- Do not turn on **Preload camera stream** for a battery camera. If it is on,
+  the integration raises a repair issue in **Settings → Repairs** that can
+  turn it off for you.
+
+A camera counts as battery-powered when it reports a battery level.
 
 Each camera also exposes a **Stream profile** select entity:
 
@@ -242,7 +279,7 @@ triggers:
 
 variables:
   camera_map:
-    binary_sensor.citofono_motion: camera.balcony_balcony
+    binary_sensor.balcony_motion: camera.balcony_balcony
     binary_sensor.garage_motion: camera.garage_garage
   camera_entity: "{{ camera_map[trigger.entity_id] }}"
   name: "{{ trigger.to_state.name | default(trigger.entity_id) }}"

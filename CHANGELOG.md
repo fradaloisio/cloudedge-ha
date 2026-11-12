@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+Changes:
+- Add options (Configure): refresh interval, a maximum live view time for battery cameras, session keepalives for battery cameras, and camera audio.
+- Limit a battery camera's live view to 10 minutes by default, then let the camera rest: a dashboard left open no longer keeps it awake for good.
+- Raise a repair issue when "Preload camera stream" is on for a battery camera, with a fix that turns it off.
+- Fix the Motion Sensitivity and Speaker Volume sensors, which failed as soon as they were enabled.
+- Shorten the frozen picture after a camera stops answering from 90 to 60 seconds.
+
 ## 1.4.4
 
 Fixes live streaming, account setup and camera diagnostics, using pycloudedge 0.1.12. Cameras that previously negotiated a relay connection without displaying video can now stream in Home Assistant.
