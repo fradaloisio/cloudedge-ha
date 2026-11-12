@@ -4,7 +4,7 @@
   "version": "1.4.4",
   "documentation": "https://github.com/fradaloisio/cloudedge-ha",
   "issue_tracker": "https://github.com/fradaloisio/cloudedge-ha/issues",
-  "dependencies": ["stream"],
+  "dependencies": ["repairs", "stream"],
   "codeowners": ["@fradaloisio"],
   "requirements": [
     "pycloudedge==0.1.12",
