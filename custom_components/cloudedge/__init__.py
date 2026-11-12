@@ -31,10 +31,10 @@ from .const import (
     CONF_COUNTRY_CODE,
     CONF_PHONE_CODE,
     CONF_REFRESH_INTERVAL,
-    DEFAULT_REFRESH_INTERVAL,
 )
+from .options import entry_options, stream_options
 from .services import async_setup_services, async_unload_services
-from .stream_bridge import CloudEdgeStreamManager
+from .stream_bridge import CloudEdgeStreamManager, StreamOptions
 from .auth_recovery import refresh_invalid_session
 
 _LOGGER = logging.getLogger(__name__)
@@ -58,11 +58,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     password = entry.data[CONF_PASSWORD]
     country_code = entry.data[CONF_COUNTRY_CODE]
     phone_code = entry.data[CONF_PHONE_CODE]
-    refresh_interval = entry.data.get(CONF_REFRESH_INTERVAL, DEFAULT_REFRESH_INTERVAL)
 
-    # Create coordinator
+    # Create coordinator. A change of options reloads the entry.
     coordinator = CloudEdgeCoordinator(
-        hass, username, password, country_code, phone_code, refresh_interval, entry
+        hass, username, password, country_code, phone_code,
+        entry_options(entry)[CONF_REFRESH_INTERVAL], entry, stream_options(entry),
     )
 
     # Validate authentication before first refresh.
@@ -180,6 +180,7 @@ class CloudEdgeCoordinator(DataUpdateCoordinator):
         phone_code: str,
         refresh_interval: int,
         config_entry: ConfigEntry,
+        stream_options: StreamOptions | None = None,
     ) -> None:
         """Initialize."""
         self.username = username
@@ -204,7 +205,7 @@ class CloudEdgeCoordinator(DataUpdateCoordinator):
         # executor thread but cannot cancel it, so a slow fetch must never
         # overlap the next attempt and race on client/session state.
         self._fetch_lock = threading.Lock()
-        self._stream_manager = CloudEdgeStreamManager(self)
+        self._stream_manager = CloudEdgeStreamManager(self, stream_options)
         self._stream_source_listeners: dict[str, set[Callable[[], None]]] = {}
         
         _LOGGER.info(

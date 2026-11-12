@@ -38,8 +38,32 @@
   "options": {
     "step": {
       "init": {
+        "title": "Opzioni CloudEdge",
+        "description": "Salvare una modifica ricarica l'integrazione e chiude le live in corso.",
         "data": {
-          "refresh_interval": "Intervallo di Aggiornamento (minuti)"
+          "refresh_interval": "Intervallo di aggiornamento (minuti)",
+          "battery_max_live_minutes": "Camere a batteria: durata massima della live (minuti)",
+          "battery_keepalive": "Camere a batteria: continua a trasmettere finché qualcuno guarda",
+          "stream_audio": "Audio della camera nelle live"
+        },
+        "data_description": {
+          "refresh_interval": "Ogni quanto vengono letti dal cloud lo stato e le impostazioni dei dispositivi.",
+          "battery_max_live_minutes": "Trascorso questo tempo la live si ferma e la camera riposa: 1 minuto la prima volta, poi il doppio ogni volta, fino a 1 ora, finché un viewer resta collegato. 0 toglie il limite.",
+          "battery_keepalive": "Se disattivato, la camera chiude da sola ogni finestra di live dopo circa 2 minuti, e l'immagine resta ferma fino a un minuto mentre si apre la finestra successiva.",
+          "stream_audio": "Disattiva per uno stream solo video, per esempio se la riproduzione si blocca."
+        }
+      }
+    }
+  },
+  "issues": {
+    "preload_battery_camera": {
+      "title": "La precarica dello stream tiene sveglia {camera}",
+      "fix_flow": {
+        "step": {
+          "confirm": {
+            "title": "La precarica dello stream tiene sveglia {camera}",
+            "description": "{camera} funziona a batteria. Con l'opzione che precarica lo stream della telecamera (\"Preload camera stream\") attiva, Home Assistant tiene aperta la live anche quando nessuno guarda: la camera viene risvegliata di continuo e la batteria si scarica.\n\nConferma per disattivare la precarica su questa camera."
+          }
         }
       }
     }

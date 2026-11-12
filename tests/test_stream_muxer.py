@@ -16,6 +16,7 @@ import re
 import shutil
 import socket
 import subprocess
+import tempfile
 import threading
 import time
 from types import SimpleNamespace
@@ -34,6 +35,7 @@ from homeassistant.core import HomeAssistant
 from custom_components.cloudedge import stream_bridge as bridge_module
 from custom_components.cloudedge.stream_bridge import (
     CloudEdgeStreamBridge,
+    StreamOptions,
     _extract_parameter_sets,
 )
 
@@ -243,6 +245,74 @@ def test_muxer_delivers_continuous_realtime_video_and_audio(
     with av.open(io.BytesIO(media)) as container:
         decoded = sum(1 for _ in container.decode(video=0))
     assert decoded == len(pts["video"]), "The published video packets must all decode"
+
+
+@pytest.mark.parametrize("video_units", ["h264"], indirect=True)
+def test_stream_without_camera_audio_carries_video_only(video_units, tmp_path, monkeypatch):
+    # The audio option off: FFmpeg gets no audio input at all (no silence
+    # track, no FIFO), and the viewer a plain video stream.
+    codec, units = video_units
+    scratch = tmp_path / "tmp"
+    scratch.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(scratch))
+
+    def camera_feed(on_video):
+        next_write = time.monotonic()
+        for unit in units[:20]:
+            on_video(unit)
+            next_write += 0.2
+            time.sleep(max(0.0, next_write - time.monotonic()))
+
+    camera = ScriptedCamera(camera_feed)
+    bridge = CloudEdgeStreamBridge(
+        camera.coordinator(), "media-video-only", StreamOptions(audio=False)
+    )
+    monkeypatch.setattr(bridge, "_wait_for_prewake", lambda: True)
+    chunks: list[bytes] = []
+    tx, rx = socket.socketpair()
+    rx.settimeout(0.5)
+
+    def consume():
+        while True:
+            try:
+                data = rx.recv(32768)
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            if not data:
+                return
+            chunks.append(data)
+
+    reader = threading.Thread(target=consume, daemon=True)
+    reader.start()
+    assert bridge._register_stream_client(tx)
+    bridge._running = True
+    bridge._session_generation = 1
+    bridge._pacer_fps = 5.0
+    worker = threading.Thread(target=bridge._stream_worker, args=(1,), daemon=True)
+    try:
+        worker.start()
+        assert camera.delivered.wait(30), "the camera never finished its frames"
+        time.sleep(0.5)
+        audio_fifos = list(scratch.iterdir())
+    finally:
+        bridge.stop("manager_stop")
+        camera.stopped.set()
+        worker.join(5)
+        tx.close()
+        reader.join(timeout=2)
+        rx.close()
+        reader.join(timeout=1)
+
+    assert not camera.errors, camera.errors
+    assert audio_fifos == []
+    with av.open(io.BytesIO(b"".join(chunks))) as container:
+        assert [stream.type for stream in container.streams] == ["video"]
+        video = container.streams.video[0]
+        assert (video.codec_context.name, video.width, video.height) == (codec, 64, 64)
+        packets = sum(1 for packet in container.demux(video) if packet.size)
+    assert packets >= 18, "video was dropped or held without the audio track"
 
 
 @pytest.mark.parametrize("video_units", ["h264"], indirect=True)

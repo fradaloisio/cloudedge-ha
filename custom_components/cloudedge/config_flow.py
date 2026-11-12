@@ -10,7 +10,7 @@ from typing import Any
 import voluptuous as vol
 
 from homeassistant import config_entries
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.data_entry_flow import FlowResult
 from homeassistant.exceptions import HomeAssistantError
 
@@ -21,11 +21,16 @@ from .const import (
     CONF_COUNTRY_CODE,
     CONF_PHONE_CODE,
     CONF_REFRESH_INTERVAL,
+    CONF_BATTERY_KEEPALIVE,
+    CONF_BATTERY_MAX_LIVE_MINUTES,
+    CONF_STREAM_AUDIO,
     DEFAULT_REFRESH_INTERVAL,
     DEFAULT_COUNTRY_CODE,
     DEFAULT_PHONE_CODE,
     COUNTRY_CODES,
+    MAX_BATTERY_MAX_LIVE_MINUTES,
 )
+from .options import entry_options
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -42,6 +47,19 @@ STEP_USER_DATA_SCHEMA = vol.Schema(
         vol.Optional(CONF_REFRESH_INTERVAL, default=DEFAULT_REFRESH_INTERVAL): vol.All(
             vol.Coerce(int), vol.Range(min=1, max=60)
         ),
+    }
+)
+
+OPTIONS_SCHEMA = vol.Schema(
+    {
+        vol.Required(CONF_REFRESH_INTERVAL): vol.All(
+            vol.Coerce(int), vol.Range(min=1, max=60)
+        ),
+        vol.Required(CONF_BATTERY_MAX_LIVE_MINUTES): vol.All(
+            vol.Coerce(int), vol.Range(min=0, max=MAX_BATTERY_MAX_LIVE_MINUTES)
+        ),
+        vol.Required(CONF_BATTERY_KEEPALIVE): bool,
+        vol.Required(CONF_STREAM_AUDIO): bool,
     }
 )
 
@@ -126,6 +144,14 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     VERSION = 1
     _reauth_entry: config_entries.ConfigEntry | None = None
 
+    @staticmethod
+    @callback
+    def async_get_options_flow(
+        config_entry: config_entries.ConfigEntry,
+    ) -> OptionsFlowHandler:
+        """Return the options flow."""
+        return OptionsFlowHandler()
+
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
@@ -202,6 +228,23 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             data_schema=vol.Schema({vol.Required(CONF_PASSWORD): str}),
             description_placeholders={"username": entry.data[CONF_USERNAME]},
             errors=errors,
+        )
+
+
+class OptionsFlowHandler(config_entries.OptionsFlowWithReload):
+    """Polling and live-stream options. Saving a change reloads the entry."""
+
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Show the options with their current values, then store them."""
+        if user_input is not None:
+            return self.async_create_entry(data=user_input)
+        return self.async_show_form(
+            step_id="init",
+            data_schema=self.add_suggested_values_to_schema(
+                OPTIONS_SCHEMA, entry_options(self.config_entry)
+            ),
         )
 
 

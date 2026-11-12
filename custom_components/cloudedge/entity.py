@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .const import DOMAIN
+from .const import BATTERY_PARAMETER_CODE, DOMAIN
 
 # Device type_ids that expose camera/live-stream capabilities. Devices
 # without a matching type_id (chimes, sensors, ...) must never become
@@ -14,6 +14,12 @@ CAMERA_TYPE_IDS = (1, 2, 3, 4, 5)
 def is_camera_device(device_info: dict[str, Any] | None) -> bool:
     """Return True for devices that support camera/live-stream entities."""
     return bool(device_info) and device_info.get("type_id") in CAMERA_TYPE_IDS
+
+
+def is_battery_device(device_info: dict[str, Any] | None) -> bool:
+    """Return True for a device that runs on a battery: it reports its level."""
+    configuration = (device_info or {}).get("configuration")
+    return isinstance(configuration, dict) and BATTERY_PARAMETER_CODE in configuration
 
 
 class CloudEdgeEntityMixin:

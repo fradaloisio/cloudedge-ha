@@ -38,8 +38,32 @@
   "options": {
     "step": {
       "init": {
+        "title": "CloudEdge options",
+        "description": "Saving a change reloads the integration and ends the live views in progress.",
         "data": {
-          "refresh_interval": "Refresh Interval (minutes)"
+          "refresh_interval": "Refresh interval (minutes)",
+          "battery_max_live_minutes": "Battery cameras: maximum live view time (minutes)",
+          "battery_keepalive": "Battery cameras: keep streaming while someone is watching",
+          "stream_audio": "Camera audio in live streams"
+        },
+        "data_description": {
+          "refresh_interval": "How often device status and settings are read from the cloud.",
+          "battery_max_live_minutes": "After this time the live view stops and the camera rests: 1 minute at first, doubling up to 1 hour for as long as a viewer stays connected. 0 removes the limit.",
+          "battery_keepalive": "When off, the camera ends each live window on its own after about 2 minutes, and the picture freezes for up to a minute while the next window opens.",
+          "stream_audio": "Turn off for a video-only stream, for example if playback stalls."
+        }
+      }
+    }
+  },
+  "issues": {
+    "preload_battery_camera": {
+      "title": "\"Preload camera stream\" keeps {camera} awake",
+      "fix_flow": {
+        "step": {
+          "confirm": {
+            "title": "\"Preload camera stream\" keeps {camera} awake",
+            "description": "{camera} runs on a battery. With \"Preload camera stream\" enabled, Home Assistant keeps its live stream open even when nobody is watching: the camera is woken again and again, and its battery drains.\n\nSubmit to turn the preload off for this camera."
+          }
         }
       }
     }

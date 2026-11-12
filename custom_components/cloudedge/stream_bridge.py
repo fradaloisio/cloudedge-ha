@@ -24,9 +24,11 @@ import subprocess
 import tempfile
 import threading
 import time
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
+from .entity import is_battery_device
 from .stream_profile_policy import (
     resolve_auto_stream_ids,
     resolve_stream_profile_ids,
@@ -53,6 +55,16 @@ _MAX_CONSECUTIVE_STREAM_FAILURES = 4
 # the first video frame or a stream profile change resets it.
 _FAILED_SESSION_COOLDOWN = 60.0
 _FAILED_SESSION_COOLDOWN_MAX = 600.0
+# A battery camera that reaches its maximum live view time rests before the
+# next live view may start. A viewer that is still connected then (a dashboard
+# left open, a preloaded stream) reopens the view after every rest, so the
+# rest doubles each time the limit is reached again, up to an hour. A view
+# that ends because its viewers left, a stream profile change, or a view that
+# starts _LIVE_LIMIT_FORGET after the rest ended (nobody was waiting for it:
+# HA's stream worker retries within minutes) starts from the first rest again.
+_LIVE_LIMIT_REST = 60.0
+_LIVE_LIMIT_REST_MAX = 3600.0
+_LIVE_LIMIT_FORGET = 600.0
 _WAKE_RETRY_COOLDOWN = 15.0
 _PREWAKE_RESULT_TTL = 30.0
 _ONLINE_GRACE_WINDOW = 20.0
@@ -141,6 +153,26 @@ _STREAM_PROFILE_ALIASES = {
     "sd": STREAM_PROFILE_SUBSTREAM,
     STREAM_PROFILE_SUBSTREAM: STREAM_PROFILE_SUBSTREAM,
 }
+
+
+@dataclass(frozen=True)
+class StreamOptions:
+    """Live-stream settings of a config entry."""
+
+    # Camera audio in the stream (AAC); off leaves a video-only stream.
+    audio: bool = True
+    # Battery cameras only. Session keepalives keep the camera streaming
+    # while someone watches; without them it ends each live window itself
+    # after about two minutes.
+    battery_keepalive: bool = True
+    # Battery cameras only: seconds of live view before the camera rests
+    # (0 = no limit).
+    battery_max_live: float = 0.0
+
+
+def _live_limit_rest(hits: int) -> float:
+    """Return the rest after the live view limit was reached `hits` times in a row."""
+    return min(_LIVE_LIMIT_REST_MAX, _LIVE_LIMIT_REST * 2 ** min(10, max(0, hits - 1)))
 
 
 def _failed_session_cooldown(failures: int) -> float:
@@ -283,9 +315,15 @@ def _extract_parameter_sets(frame_data: bytes, codec: str) -> bytes:
 class CloudEdgeStreamBridge:
     """Bridge one CloudEdge camera to a local MPEG-TS HTTP endpoint."""
 
-    def __init__(self, coordinator: CloudEdgeCoordinator, serial_number: str) -> None:
+    def __init__(
+        self,
+        coordinator: CloudEdgeCoordinator,
+        serial_number: str,
+        options: StreamOptions | None = None,
+    ) -> None:
         self._coordinator = coordinator
         self._serial_number = serial_number
+        self._options = options or StreamOptions()
 
         self._lock = threading.Lock()
         self._running = False
@@ -368,6 +406,11 @@ class CloudEdgeStreamBridge:
         # nothing about the camera. A second stop while the attempt is still
         # closing records a later generation, hence the >= in the worker.
         self._bridge_stopped_attempt = 0
+        # Live view limit of a battery camera (see _LIVE_LIMIT_REST).
+        self._battery_camera = False
+        self._live_started_at = 0.0
+        self._live_limit_until = 0.0
+        self._live_limit_hits = 0
 
         self._last_request_time = 0.0
         self._last_client_time = 0.0
@@ -388,6 +431,10 @@ class CloudEdgeStreamBridge:
     def is_streaming(self) -> bool:
         """Return whether the bridge is currently active."""
         return self._running
+
+    @property
+    def _audio_enabled(self) -> bool:
+        return _AUDIO_ENABLED and self._options.audio
 
     @property
     def client_count(self) -> int:
@@ -443,6 +490,8 @@ class CloudEdgeStreamBridge:
             self._auto_substream_failures = 0
             self._consecutive_stream_failures = 0
             self._failure_cooldown_until = 0.0
+            self._live_limit_until = 0.0
+            self._live_limit_hits = 0
             self._profile_changed.set()
             self._bridge_stopped_attempt = self._attempt_generation
             self._attempt_generation += 1
@@ -460,9 +509,13 @@ class CloudEdgeStreamBridge:
         openapi_base = getattr(client, "OPENAPI_BASE_URL", "") if client else ""
         openapi_host = urlparse(openapi_base).hostname or None
         with self._metrics_lock:
-            cooldown = max(0.0, self._failure_cooldown_until - time.monotonic())
+            now = time.monotonic()
+            cooldown = max(0.0, self._failure_cooldown_until - now)
+            live_limit_rest = max(0.0, self._live_limit_until - now)
             state = self._stream_state
-            if state == "retry_cooldown" and not cooldown:
+            if (state == "retry_cooldown" and not cooldown) or (
+                state == "live_limit" and not live_limit_rest
+            ):
                 state = "idle"  # the pause expired or a profile change reset it
             if self._active_video_id is None:
                 active_profile = None  # no stream opened for this profile yet
@@ -495,7 +548,7 @@ class CloudEdgeStreamBridge:
                 # VideoBuffer admission refusals only: frames discarded with
                 # a retired GOP are not counted.
                 "stream_dropped_frames": self._video_dropped_frames,
-                "stream_audio_codec": "pcm_mulaw/8000",
+                "stream_audio_codec": "pcm_mulaw/8000" if self._audio_enabled else None,
                 "stream_audio_frames": self._audio_frames,
                 "stream_audio_bytes": self._audio_bytes,
                 "stream_audio_active": bool(
@@ -504,6 +557,8 @@ class CloudEdgeStreamBridge:
                 ),
                 "stream_last_error": self._last_error,
                 "stream_retry_cooldown": round(cooldown, 1),
+                # Seconds a battery camera still rests after its live view limit.
+                "stream_live_limit_rest": round(live_limit_rest, 1),
             }
 
     def ensure_started(self) -> str | None:
@@ -815,6 +870,21 @@ class CloudEdgeStreamBridge:
                 )
                 return False
 
+            now = time.monotonic()
+            if self._live_limit_until > now:
+                with self._metrics_lock:
+                    self._stream_state = "live_limit"
+                _LOGGER.debug(
+                    "Rejecting live view of %s: the camera rests %.0fs more after "
+                    "its live view limit",
+                    self._serial_number,
+                    self._live_limit_until - now,
+                )
+                return False
+            if now - self._live_limit_until > _LIVE_LIMIT_FORGET:
+                self._live_limit_hits = 0
+            self._live_started_at = now
+
             # HA may ask for stream_source() speculatively. Wake only after its
             # stream worker (or go2rtc) has opened the local source with its
             # secret URL, which proves there is a real consumer for this camera.
@@ -1001,7 +1071,7 @@ class CloudEdgeStreamBridge:
             return self._start_ffmpeg_muxer_locked(video_codec)
 
     def _start_ffmpeg_muxer_locked(self, video_codec: str) -> bool:
-        audio_fifo = self._prepare_audio_fifo() if _AUDIO_ENABLED else None
+        audio_fifo = self._prepare_audio_fifo() if self._audio_enabled else None
         cmd = [
             "ffmpeg",
             "-hide_banner",
@@ -1656,6 +1726,7 @@ class CloudEdgeStreamBridge:
                 if client is None or device is None:
                     time.sleep(2)
                     continue
+                battery_camera = self._battery_camera = is_battery_device(device)
 
                 with self._lock:
                     if not _session_active():
@@ -1829,15 +1900,20 @@ class CloudEdgeStreamBridge:
                     create_kwargs = dict(
                         device=device,
                         on_video=on_video,
-                        on_audio=on_audio,
+                        on_audio=on_audio if self._audio_enabled else None,
                         on_login=on_login,
                         on_disconnect=on_disconnect,
                         video_id=video_id,
                     )
-                    if _AUDIO_ENABLED and "on_audio" in create_parameters:
-                        create_kwargs["on_audio"] = on_audio
                     if supports_external_switch:
                         create_kwargs["manage_stream_switch"] = False
+                    if (
+                        battery_camera
+                        and not self._options.battery_keepalive
+                        and "keepalive" in create_parameters
+                    ):
+                        # The camera then ends each live window on its own.
+                        create_kwargs["keepalive"] = False
                     streamer = client.create_streamer(**create_kwargs)
                     if streamer is None:
                         _LOGGER.error("Failed to create P2P streamer for %s", self._serial_number)
@@ -2032,13 +2108,43 @@ class CloudEdgeStreamBridge:
             time.sleep(0.05)
         return False
 
+    def _live_limit_reached(self) -> bool:
+        limit = self._options.battery_max_live
+        return bool(
+            limit
+            and self._battery_camera
+            and time.monotonic() - self._live_started_at >= limit
+        )
+
+    def _rest_after_live_limit(self, gen: int) -> None:
+        """End the live view of a battery camera that reached its limit."""
+        with self._lock:
+            if not self._running or gen != self._session_generation:
+                return
+            self._live_limit_hits += 1
+            rest = _live_limit_rest(self._live_limit_hits)
+            self._live_limit_until = time.monotonic() + rest
+            _LOGGER.info(
+                "Live view of %s reached its %.0f min limit; the camera rests for %.0fs",
+                self._serial_number,
+                self._options.battery_max_live / 60,
+                rest,
+            )
+            # The stop reason is the state for the whole rest.
+            self._stop_locked("live_limit")
+
     def _idle_watch_loop(self, gen: int) -> None:
         while self._running and gen == self._session_generation:
             time.sleep(1)
+            if self._live_limit_reached():
+                self._rest_after_live_limit(gen)
+                return
             if self._should_keep_running():
                 continue
             _LOGGER.debug("Stopping idle live stream for %s", self._serial_number)
             with self._lock:
+                # The viewers left: the next view is a new one.
+                self._live_limit_hits = 0
                 streamer = self._p2p_streamer
                 if streamer is not None:
                     self._bridge_stopped_attempt = self._attempt_generation
@@ -2057,8 +2163,11 @@ class CloudEdgeStreamBridge:
 class CloudEdgeStreamManager:
     """Manage per-device stream bridges for a CloudEdge account."""
 
-    def __init__(self, coordinator: CloudEdgeCoordinator) -> None:
+    def __init__(
+        self, coordinator: CloudEdgeCoordinator, options: StreamOptions | None = None
+    ) -> None:
         self._coordinator = coordinator
+        self._options = options or StreamOptions()
         self._bridges: dict[str, CloudEdgeStreamBridge] = {}
         self._lock = threading.Lock()
 
@@ -2066,7 +2175,9 @@ class CloudEdgeStreamManager:
         with self._lock:
             bridge = self._bridges.get(serial_number)
             if bridge is None:
-                bridge = CloudEdgeStreamBridge(self._coordinator, serial_number)
+                bridge = CloudEdgeStreamBridge(
+                    self._coordinator, serial_number, self._options
+                )
                 self._bridges[serial_number] = bridge
             return bridge
 
@@ -2098,7 +2209,9 @@ class CloudEdgeStreamManager:
             "stream_available_video_ids": [],
             "stream_state": "idle",
             "stream_dropped_frames": 0,
-            "stream_audio_codec": "pcm_mulaw/8000",
+            "stream_audio_codec": (
+                "pcm_mulaw/8000" if _AUDIO_ENABLED and self._options.audio else None
+            ),
             "stream_audio_frames": 0,
             "stream_audio_bytes": 0,
             "stream_audio_active": False,
