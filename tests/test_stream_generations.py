@@ -178,3 +178,53 @@ def test_callback_paused_during_mux_start_cannot_publish_into_next_session(
     assert bridge._video_codec is None
     assert bridge._video_queue.empty()
     assert stop_returned == [True], "stop() returned while a media callback ran"
+
+
+def test_retired_session_that_keeps_streaming_is_asked_to_stop_again(sessions):
+    # pycloudedge <= 0.1.12 drops a stop requested before run_session()
+    # starts: the retired session would keep the camera streaming, every
+    # frame discarded (C06). Its next callback repeats the request.
+    bridge = sessions.bridge
+    stopped = threading.Event()
+    delivered = threading.Event()
+
+    def retired_but_streaming(on_video):
+        assert stopped.wait(5)
+        on_video(H264_KEYFRAME)
+        delivered.set()
+        assert sessions.release[0].wait(5)
+
+    sessions.first_session = retired_but_streaming
+    sessions.start()
+    assert sessions.entered[0].wait(5)
+    streamer = sessions.created[0]
+    bridge.stop("worker_exit")
+    assert streamer.request_stop.call_count == 1
+    stopped.set()
+    assert delivered.wait(5)
+
+    assert streamer.request_stop.call_count == 2
+    assert not bridge._got_keyframe, "the frame itself is discarded"
+
+
+def test_live_session_gets_a_copy_of_the_coordinator_device(sessions, monkeypatch):
+    # The library refreshes streaming metadata into the device dict it is
+    # given, from the stream worker: the coordinator's own dict must not
+    # change outside the event loop (C22).
+    bridge = sessions.bridge
+    device = {"serial_number": "sn", "device_id": "id", "type_id": 1}
+    monkeypatch.setattr(bridge._coordinator, "get_device_for_stream", lambda _: device)
+    create = bridge._coordinator.client.create_streamer
+    received = []
+
+    def create_and_refresh(device, **kwargs):
+        received.append(device)
+        device["host_key"] = "refreshed"
+        return create(device=device, **kwargs)
+
+    monkeypatch.setattr(bridge._coordinator.client, "create_streamer", create_and_refresh)
+    sessions.start()
+    assert sessions.entered[0].wait(5)
+
+    assert received[0]["serial_number"] == "sn"
+    assert device == {"serial_number": "sn", "device_id": "id", "type_id": 1}

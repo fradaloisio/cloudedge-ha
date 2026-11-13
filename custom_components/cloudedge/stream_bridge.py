@@ -1880,6 +1880,8 @@ class CloudEdgeStreamBridge:
                     _LOGGER.info("Live stream disconnected for %s", self._serial_number)
                     self._coordinator.notify_stream_state_changed()
 
+                attempt_streamer: list = [None]
+
                 def guarded(callback, callback_token: int):
                     def invoke(*args):
                         # Stop/start and media admission share one order:
@@ -1888,6 +1890,16 @@ class CloudEdgeStreamBridge:
                         with self._lock:
                             if _attempt_active(callback_token):
                                 callback(*args)
+                                return
+                        # A retired attempt still running: pycloudedge <= 0.1.12
+                        # drops a stop requested before run_session() starts,
+                        # and the camera would stream on unwatched. Ask again.
+                        retired = attempt_streamer[0]
+                        if retired is not None:
+                            try:
+                                retired.request_stop()
+                            except Exception:
+                                pass
                     return invoke
 
                 on_video = guarded(on_video, token)
@@ -1898,7 +1910,9 @@ class CloudEdgeStreamBridge:
                 streamer = None
                 try:
                     create_kwargs = dict(
-                        device=device,
+                        # The library refreshes streaming metadata into this
+                        # dict from this thread: never the coordinator's own.
+                        device=dict(device),
                         on_video=on_video,
                         on_audio=on_audio if self._audio_enabled else None,
                         on_login=on_login,
@@ -1918,6 +1932,7 @@ class CloudEdgeStreamBridge:
                     if streamer is None:
                         _LOGGER.error("Failed to create P2P streamer for %s", self._serial_number)
                         return
+                    attempt_streamer[0] = streamer
                     with self._lock:
                         if not _attempt_active(token):
                             streamer.request_stop()
