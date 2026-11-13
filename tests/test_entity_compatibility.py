@@ -96,6 +96,39 @@ def test_parameters_arriving_after_startup_add_entities_without_reload(tmp_path,
     asyncio.run(run())
 
 
+def test_updates_without_new_parameters_do_not_rebuild_the_sensors(tmp_path, monkeypatch):
+    # Every coordinator update, stream state notifications included, built
+    # all candidate sensors again with ~245 registry lookups per device (C120).
+    async def run():
+        coordinator = make_coordinator(tmp_path)
+        hass = coordinator.hass
+        await load_empty_registries(hass)
+        registry = er.async_get(hass)
+        lookups = []
+        lookup = registry.async_get_entity_id
+        monkeypatch.setattr(
+            registry, "async_get_entity_id",
+            lambda *args: lookups.append(args) or lookup(*args),
+        )
+        hass.data[DOMAIN] = {coordinator.config_entry.entry_id: coordinator}
+        coordinator.data = {"sn": device({"154": {"value": 75}})}
+        entities = []
+        await sensor.async_setup_entry(hass, coordinator.config_entry, entities.extend)
+        assert lookups
+        lookups.clear()
+        count = len(entities)
+
+        coordinator.data["sn"]["configuration"]["154"]["value"] = 70
+        coordinator.async_update_listeners()
+        assert (lookups, len(entities)) == ([], count)
+
+        coordinator.data["sn"]["configuration"]["150"] = {"value": "1"}
+        coordinator.async_update_listeners()
+        assert lookups
+        assert len(entities) == count + 1
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("platform,unique_id", _PLATFORM_EXPECTATIONS)
 def test_second_device_gets_entities_on_every_platform(tmp_path, platform, unique_id):
     async def run():
