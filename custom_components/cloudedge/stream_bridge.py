@@ -1882,7 +1882,9 @@ class CloudEdgeStreamBridge:
 
                 attempt_streamer: list = [None]
 
-                def guarded(callback, callback_token: int):
+                def guarded(callback, callback_token: int, retired_streamer: list):
+                    # retired_streamer is bound here, per attempt: the name
+                    # attempt_streamer moves on to the next attempt's holder.
                     def invoke(*args):
                         # Stop/start and media admission share one order:
                         # bridge lock -> muxer lock -> consumer lock. A callback
@@ -1894,7 +1896,7 @@ class CloudEdgeStreamBridge:
                         # A retired attempt still running: pycloudedge <= 0.1.12
                         # drops a stop requested before run_session() starts,
                         # and the camera would stream on unwatched. Ask again.
-                        retired = attempt_streamer[0]
+                        retired = retired_streamer[0]
                         if retired is not None:
                             try:
                                 retired.request_stop()
@@ -1902,10 +1904,10 @@ class CloudEdgeStreamBridge:
                                 pass
                     return invoke
 
-                on_video = guarded(on_video, token)
-                on_audio = guarded(on_audio, token)
-                on_login = guarded(on_login, token)
-                on_disconnect = guarded(on_disconnect, token)
+                on_video = guarded(on_video, token, attempt_streamer)
+                on_audio = guarded(on_audio, token, attempt_streamer)
+                on_login = guarded(on_login, token, attempt_streamer)
+                on_disconnect = guarded(on_disconnect, token, attempt_streamer)
 
                 streamer = None
                 try:

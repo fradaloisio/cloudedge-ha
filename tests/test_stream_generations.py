@@ -228,3 +228,28 @@ def test_live_session_gets_a_copy_of_the_coordinator_device(sessions, monkeypatc
 
     assert received[0]["serial_number"] == "sn"
     assert device == {"serial_number": "sn", "device_id": "id", "type_id": 1}
+
+
+def test_late_callback_of_a_retired_attempt_leaves_the_next_one_alone(monkeypatch):
+    # A library that calls back from its own threads could deliver a retired
+    # attempt's frame after the next attempt started: the repeated stop must
+    # reach the retired session only (review).
+    from test_stream_options import WatchedCamera, wait_until
+    from custom_components.cloudedge.stream_bridge import StreamOptions
+
+    camera = WatchedCamera(monkeypatch, StreamOptions())
+    try:
+        assert camera.view()
+        late_audio = camera.sessions[0]["on_audio"]
+        camera.bridge.set_stream_profile("SD")  # retires the first attempt
+        wait_until(
+            lambda: len(camera.streamers) == 2 and camera.streamers[1].streaming,
+            "the next attempt never started",
+        )
+
+        late_audio(b"\xff" * 160)
+
+        assert camera.streamers[0].request_stop.call_count == 2
+        assert not camera.streamers[1].request_stop.called
+    finally:
+        camera.close()
