@@ -8,6 +8,7 @@ import voluptuous as vol
 
 pytest.importorskip("homeassistant")
 
+from homeassistant.config_entries import OptionsFlowManager
 from homeassistant.core import HomeAssistant
 
 from custom_components.cloudedge import CloudEdgeCoordinator, async_setup_entry
@@ -86,6 +87,47 @@ def test_options_form_shows_the_current_values_and_stores_the_new_ones():
         saved = await open_options(entry).async_step_init(dict(CHOSEN))
 
         assert (saved["type"], saved["data"]) == ("create_entry", CHOSEN)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("stored", "submitted", "reloads"),
+    [
+        ({}, CHOSEN, 1),
+        # An entry from before the options, saved as shown: nothing changes.
+        ({}, None, 0),
+        (CHOSEN, CHOSEN, 0),
+    ],
+    ids=["changed", "defaults-kept", "unchanged"],
+)
+def test_saving_the_options_reloads_the_entry_only_when_they_change(
+    stored, submitted, reloads
+):
+    # Home Assistant's own options flow manager applies the result: a
+    # changed option takes effect through a reload, which ends live views.
+    async def run():
+        entry = make_entry({**SETUP_DATA, "refresh_interval": 7}, stored)
+        entry.update_listeners = []
+        flow = open_options(entry)
+
+        def update_entry(entry, *, options):
+            changed, entry.options = options != entry.options, options
+            return changed
+
+        flow.hass.config_entries.async_update_entry = update_entry
+        manager = OptionsFlowManager(flow.hass)
+        form = await flow.async_step_init()
+        shown = {
+            str(field): field.description["suggested_value"]
+            for field in form["data_schema"].schema
+        }
+        result = await flow.async_step_init(dict(submitted or shown))
+
+        await manager.async_finish_flow(flow, result)
+
+        assert flow.hass.config_entries.async_schedule_reload.call_count == reloads
+        assert entry_options(entry) == (submitted or shown)
 
     asyncio.run(run())
 

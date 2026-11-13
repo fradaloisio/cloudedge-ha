@@ -247,6 +247,10 @@ class OptionsFlowHandler(config_entries.OptionsFlowWithReload):
     ) -> FlowResult:
         """Show the options with their current values, then store them."""
         if user_input is not None:
+            if user_input == entry_options(self.config_entry):
+                # Nothing changed: storing the defaults an entry made before
+                # the options holds would still reload it, ending live views.
+                return self.async_create_entry(data=dict(self.config_entry.options))
             return self.async_create_entry(data=user_input)
         return self.async_show_form(
             step_id="init",
