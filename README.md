@@ -82,9 +82,39 @@ To change the options later, open the CloudEdge integration there and select
 | Battery cameras: keep streaming while someone is watching | On | Off lets the camera end each live window on its own after about 2 minutes; the picture then freezes for up to a minute while the next window opens. |
 | Camera audio in live streams | On | Off gives a video-only stream, for example if playback stalls. |
 
+## Actions and events
+
+| Action | What it does |
+| --- | --- |
+| `cloudedge.set_parameter` | Sets an IoT parameter of a device, named like `MOTION_DET_ENABLE`. |
+| `cloudedge.get_device_info` | Fires a `cloudedge_device_info` event with the device's details, secrets redacted; `include_config` adds its parameters. |
+| `cloudedge.refresh_device` | Reads one device again from the cloud, or every device when none is given. |
+| `cloudedge.refresh_parameters` | Reads only a device's parameters again. |
+| `cloudedge.get_coordinator_info` | Logs each account's refresh interval, last update and active live streams at INFO level. |
+| `cloudedge.clear_cache` | Deletes the saved CloudEdge session: the next request logs in again, which logs the account out of the phone app. |
+
+Devices are chosen by `device_name` or `device_id`; Developer Tools →
+Actions lists the fields of each action.
+
+Every push event from a camera (motion, person, visitor, package and the other
+alarm types) also fires a `cloudedge_event` event with `device_id`, `serial_number`,
+`device_name`, `event_type`, `event_code`, `is_motion` and
+`alarm_image_url`. For example, to trigger an automation on any motion event:
+
+```yaml
+triggers:
+  - trigger: event
+    event_type: cloudedge_event
+    event_data:
+      is_motion: true
+```
+
 ## Enable Debug Logging
 
-Add this to your `configuration.yaml` to enable detailed logging:
+Open the CloudEdge integration in **Settings → Devices & services** and select
+**Enable debug logging**; disabling it downloads the log. This covers the
+integration and the `pycloudedge` library. To keep debug logging across
+restarts, add this to `configuration.yaml` instead:
 
 ```yaml
 logger:
@@ -92,9 +122,21 @@ logger:
   logs:
     custom_components.cloudedge: debug
     cloudedge: debug
+    pycloudedge: debug
 ```
 
-Then restart Home Assistant and check the logs for detailed information.
+## Troubleshooting
+
+- **The phone app logs out, or the integration asks to sign in again**: the
+  account has only one active session, see
+  [Important note about CloudEdge sessions](#important-note-about-cloudedge-sessions).
+- **A battery camera's live view stops and does not restart for a while**:
+  the maximum live view time was reached and the camera rests, see
+  [Battery cameras](#battery-cameras).
+- **The HLS live view or still images fail while WebRTC works**: check the
+  `no_proxy` note under [Installation](#installation).
+- **A repair says "Preload camera stream" keeps a camera awake**: open it and
+  submit to turn the preload off for that camera.
 
 ## Live Streaming
 

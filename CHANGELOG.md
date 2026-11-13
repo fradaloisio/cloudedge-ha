@@ -8,6 +8,11 @@ Changes:
 - Raise a repair issue when "Preload camera stream" is on for a battery camera, with a fix that turns it off.
 - Fix the Motion Sensitivity and Speaker Volume sensors, which failed as soon as they were enabled.
 - Shorten the frozen picture after a camera stops answering from 90 to 60 seconds.
+- Setup: spaces around the email are removed, and an address that is not an email is reported on its field instead of as a connection failure.
+- "Enable debug logging" on the integration page now includes the pycloudedge library.
+- A live session that ignored its stop request (possible with pycloudedge 0.1.12 when the stop came before the session started) is asked again as soon as it delivers anything, instead of keeping the camera streaming unwatched.
+- The live stream no longer changes the coordinator's device data from its worker thread, and sensors are no longer rebuilt on every update that brings no new parameter.
+- README: actions, the `cloudedge_event` event, debug logging from the UI and troubleshooting.
 
 ## 1.4.4
 
