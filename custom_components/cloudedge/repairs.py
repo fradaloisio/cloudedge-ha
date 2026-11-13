@@ -37,14 +37,18 @@ class PreloadRepairFlow(RepairsFlow):
         await self.hass.data[DATA_CAMERA_PREFS].async_update(
             self._entity_id, preload_stream=False
         )
-        # Home Assistant ends a stream when its last viewer leaves, but the
-        # preloaded one has no viewer whose leaving would end it.
+        # Without the preload, Home Assistant removes a stream output when its
+        # idle timer fires, and ends the stream with the last output. A
+        # preloaded output's timer may already have fired, or never have
+        # started: it starts with the first video or the first viewer.
         camera = self.hass.data[DATA_COMPONENT].get_entity(self._entity_id)
         stream = getattr(camera, "stream", None)
-        if stream is not None and all(
-            output.idle for output in stream.outputs().values()
-        ):
-            await stream.stop()
+        if stream is not None:
+            for output in list(stream.outputs().values()):
+                if output.idle:
+                    await stream.remove_provider(output)
+                else:
+                    output.idle_timer.start()
         return self.async_create_entry(data={})
 
 

@@ -12,6 +12,7 @@ from homeassistant.components.camera import Camera, CameraEntityFeature
 from homeassistant.components.camera.const import DATA_CAMERA_PREFS
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -186,12 +187,31 @@ class CloudEdgeCamera(
             severity=ir.IssueSeverity.WARNING,
             translation_key=PRELOAD_ISSUE,
             translation_placeholders={"camera": name},
-            data={"entity_id": self.entity_id, "camera": name},
+            data={
+                "entity_id": self.entity_id,
+                "camera": name,
+                "entry_id": self.coordinator.config_entry.entry_id,
+            },
+        )
+
+    @callback
+    def _async_back_after_removal(self) -> bool:
+        """Return True when the entity is only unloaded, as by an entry reload.
+
+        Its repair issue must then stay: created again, it would forget that
+        the user chose to ignore it. A removed config entry deletes its
+        issues in async_remove_entry.
+        """
+        registry_entry = er.async_get(self.hass).async_get(self.entity_id)
+        return (
+            registry_entry is not None
+            and registry_entry.disabled_by is None
+            and self.coordinator.config_entry.disabled_by is None
         )
 
     async def async_will_remove_from_hass(self) -> None:
         """Stop this entity's HA Stream: HA core does not do it on removal."""
-        if self._preload_flagged:
+        if self._preload_flagged and not self._async_back_after_removal():
             ir.async_delete_issue(
                 self.hass, DOMAIN, f"{PRELOAD_ISSUE}_{self._serial_number}"
             )

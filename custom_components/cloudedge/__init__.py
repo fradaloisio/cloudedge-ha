@@ -22,6 +22,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EVENT_HOMEASSISTANT_STOP, Platform
 from homeassistant.core import Event, HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady, HomeAssistantError
+from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .const import (
@@ -138,6 +139,11 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Remove a config entry and clean up associated files."""
     _LOGGER.info("Removing CloudEdge integration and cleaning up cache files")
+
+    # The cameras keep their repair issues while unloaded: drop them now.
+    for (domain, issue_id), issue in list(ir.async_get(hass).issues.items()):
+        if domain == DOMAIN and (issue.data or {}).get("entry_id") == entry.entry_id:
+            ir.async_delete_issue(hass, DOMAIN, issue_id)
 
     def _remove_cache_files() -> None:
         # Per-entry cache plus legacy shared variants
