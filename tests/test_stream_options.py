@@ -38,11 +38,15 @@ class WatchedCamera:
     are the real ones, on their own threads; only the SDK session and the
     muxer are replaced."""
 
-    def __init__(self, monkeypatch, options, device=BATTERY_CAMERA, keepalive_parameter=True):
+    def __init__(self, monkeypatch, options, device=BATTERY_CAMERA, keepalive_parameter=True,
+                 wake_seconds=0.0):
         self.clock = [1000.0]
         self.viewers = 1
+        self.wake_seconds = wake_seconds
         self.sessions: list[dict] = []
         self.streamers: list[Mock] = []
+        # Raised on the bridge's worker thread, an assertion would be lost.
+        self.failures: list[str] = []
         monkeypatch.setattr(module.time, "monotonic", lambda: self.clock[0])
         monkeypatch.setattr(module.time, "sleep", lambda seconds: REAL_SLEEP(min(seconds, 0.005)))
         monkeypatch.setattr(
@@ -72,10 +76,12 @@ class WatchedCamera:
         streamer.request_stop.side_effect = stopped.set
 
         def run():
+            self.clock[0] += self.wake_seconds  # waking up and connecting
             on_login()
             on_video(H264_SPS + H264_PPS + H264_IDR)
             streamer.streaming = True
-            assert stopped.wait(10), "the bridge never ended the camera session"
+            if not stopped.wait(10):
+                self.failures.append("the bridge never ended the camera session")
             return 1, 20
 
         streamer.streaming = False
@@ -112,6 +118,7 @@ class WatchedCamera:
 
     def close(self) -> None:
         self.bridge.stop("manager_stop")
+        assert not self.failures
 
 
 @pytest.fixture
@@ -146,6 +153,18 @@ def test_battery_camera_live_view_stops_at_its_limit_then_rests(cameras):
     camera.clock[0] += 1
     assert camera.view()
     assert camera.bridge.diagnostics()["stream_live_limit_rest"] == 0
+
+
+def test_live_view_limit_counts_from_the_start_of_the_view(cameras):
+    # The camera is awake from the wake signal on, before its first frame.
+    camera = cameras(StreamOptions(battery_max_live=600), wake_seconds=20)
+    assert camera.view()
+    camera.watch(579)
+    assert camera.bridge.is_streaming, "the live view ended before its limit"
+
+    camera.watch(1)
+
+    assert camera.rest() == 60
 
 
 def test_rest_doubles_while_the_same_viewer_stays_connected(cameras):
@@ -190,6 +209,30 @@ def test_rest_restarts_from_a_minute_for_a_new_viewing(cameras, ending):
 
     assert camera.view()
     camera.watch(600)
+    assert camera.rest() == 60
+
+
+def test_profile_change_during_a_view_restarts_the_rest_from_a_minute(cameras):
+    camera = cameras(StreamOptions(battery_max_live=600))
+    for expected in (60, 120):
+        assert camera.view()
+        camera.watch(600)
+        assert camera.rest() == expected
+        camera.clock[0] += expected
+    assert camera.view()
+    camera.watch(300)
+
+    # The user switches profile while watching: a new viewing as far as the
+    # rest is concerned, though the limit still counts from the view's start.
+    camera.bridge.set_stream_profile("SD")
+    wait_until(
+        lambda: len(camera.streamers) == 4 and camera.streamers[-1].streaming,
+        "the new profile never streamed",
+    )
+    camera.watch(299)
+    assert camera.bridge.is_streaming
+    camera.watch(1)
+
     assert camera.rest() == 60
 
 
