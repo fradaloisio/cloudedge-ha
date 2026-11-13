@@ -71,9 +71,9 @@ async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> dict[str,
     """
     # Import here to avoid issues during startup
     from cloudedge import CloudEdgeClient
-    from cloudedge.exceptions import AuthenticationError, CloudEdgeError
+    from cloudedge.exceptions import AuthenticationError, CloudEdgeError, ValidationError
 
-    username = data[CONF_USERNAME]
+    username = data[CONF_USERNAME].strip()
     password = data[CONF_PASSWORD]
     country_code = data[CONF_COUNTRY_CODE]
     phone_code = data[CONF_PHONE_CODE]
@@ -127,6 +127,9 @@ async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> dict[str,
 
     except InvalidAuth:
         raise
+    except ValidationError as e:
+        # The library checks the email format before any request.
+        raise InvalidEmail("Invalid email address") from e
     except AuthenticationError as e:
         _LOGGER.error("Authentication failed: %s", e)
         raise InvalidAuth("Authentication failed") from e
@@ -159,10 +162,13 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         errors: dict[str, str] = {}
         
         if user_input is not None:
+            user_input = {
+                **user_input, CONF_USERNAME: user_input[CONF_USERNAME].strip()
+            }
             # Duplicate check BEFORE logging in: a validation login kills
             # the active CloudEdge session (one session per account), so
             # don't pay that price for an account that is already set up.
-            await self.async_set_unique_id(user_input[CONF_USERNAME].strip().lower())
+            await self.async_set_unique_id(user_input[CONF_USERNAME].lower())
             self._abort_if_unique_id_configured()
 
             try:
@@ -171,6 +177,8 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 return self.async_create_entry(title=info["title"], data=user_input)
             except CannotConnect:
                 errors["base"] = "cannot_connect"
+            except InvalidEmail:
+                errors[CONF_USERNAME] = "invalid_email"
             except InvalidAuth:
                 errors["base"] = "invalid_auth"
             except Exception:  # pylint: disable=broad-except
@@ -254,3 +262,7 @@ class CannotConnect(HomeAssistantError):
 
 class InvalidAuth(HomeAssistantError):
     """Error to indicate there is invalid auth."""
+
+
+class InvalidEmail(InvalidAuth):
+    """Error to indicate the username is not an email address."""

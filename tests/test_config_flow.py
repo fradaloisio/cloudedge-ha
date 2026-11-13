@@ -184,6 +184,43 @@ def test_reauth_with_bad_credentials_keeps_the_form_open():
     asyncio.run(run())
 
 
+def test_username_is_used_and_stored_without_surrounding_spaces():
+    # A pasted address often carries a space, which the library rejects
+    # as an invalid email before logging in (C29).
+    async def run():
+        hass = make_hass()
+        hass.async_add_executor_job = AsyncMock(side_effect=lambda fn, *args: fn(*args))
+        flow = make_flow(hass)
+        with patch("cloudedge.CloudEdgeClient") as client_type:
+            client_type.return_value.authenticate.return_value = True
+            client_type.return_value.get_all_devices.return_value = []
+            result = await flow.async_step_user(
+                {**USER_INPUT, "username": " user@example.test  "}
+            )
+        assert client_type.call_args.kwargs["username"] == "user@example.test"
+        assert result["type"] == "create_entry"
+        assert result["data"] == USER_INPUT
+        assert result["title"] == "CloudEdge (user@example.test)"
+        assert flow.unique_id == "user@example.test"
+
+    asyncio.run(run())
+
+
+def test_username_that_is_not_an_email_is_reported_on_its_field(caplog):
+    # The library refuses it before any request: not a connection failure,
+    # and nothing worth a logged traceback (C29).
+    async def run():
+        hass = make_hass()
+        hass.async_add_executor_job = AsyncMock(side_effect=lambda fn, *args: fn(*args))
+        flow = make_flow(hass)
+        result = await flow.async_step_user({**USER_INPUT, "username": "user"})
+        assert result["type"] == "form"
+        assert result["errors"] == {"username": "invalid_email"}
+
+    asyncio.run(run())
+    assert not [record for record in caplog.records if record.levelname == "ERROR"]
+
+
 def test_validation_counts_devices_without_pinging_them():
     # Validation only needs the device count; the default client also read
     # each device's configuration and pinged it on the local network.

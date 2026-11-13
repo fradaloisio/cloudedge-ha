@@ -3,7 +3,7 @@
     "step": {
       "user": {
         "title": "CloudEdge",
-        "description": "Set up yourCloudEdge account",
+        "description": "Set up your CloudEdge account",
         "data": {
           "username": "Email",
           "password": "Password",
@@ -14,7 +14,7 @@
       },
       "reauth_confirm": {
         "title": "CloudEdge",
-        "description": "Re-authenticate yourCloudEdge account",
+        "description": "Re-authenticate your CloudEdge account {username}",
         "data": {
           "username": "Email",
           "password": "Password",
@@ -27,6 +27,7 @@
     "error": {
       "cannot_connect": "Failed to connect to CloudEdge API",
       "invalid_auth": "Invalid authentication credentials",
+      "invalid_email": "Enter the email address of your CloudEdge account",
       "unknown": "Unexpected error occurred"
     },
     "abort": {

@@ -14,7 +14,7 @@
       },
       "reauth_confirm": {
         "title": "CloudEdge",
-        "description": "Riautentica il tuo account CloudEdge",
+        "description": "Riautentica il tuo account CloudEdge {username}",
         "data": {
           "username": "Email",
           "password": "Password",
@@ -27,6 +27,7 @@
     "error": {
       "cannot_connect": "Impossibile connettersi alle API CloudEdge",
       "invalid_auth": "Credenziali di autenticazione non valide",
+      "invalid_email": "Inserisci l'indirizzo email del tuo account CloudEdge",
       "unknown": "Si è verificato un errore imprevisto"
     },
     "abort": {
