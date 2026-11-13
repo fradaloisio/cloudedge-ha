@@ -3,9 +3,9 @@
 ## Unreleased
 
 Changes:
-- Add options (Configure): refresh interval, a maximum live view time for battery cameras, session keepalives for battery cameras, and camera audio.
+- Add options (Configure): refresh interval, a maximum live view time for battery cameras, session keepalives for battery cameras, and camera audio. Saving a change reloads the integration; saving without changes does not.
 - Limit a battery camera's live view to 10 minutes by default, then let the camera rest: a dashboard left open no longer keeps it awake for good.
-- Raise a repair issue when "Preload camera stream" is on for a battery camera, with a fix that turns it off.
+- Raise a repair issue when "Preload camera stream" is on for a battery camera, with a fix that turns it off and lets the unwatched stream end. Ignoring the issue lasts across reloads.
 - Fix the Motion Sensitivity and Speaker Volume sensors, which failed as soon as they were enabled.
 - Shorten the frozen picture after a camera stops answering from 90 to 60 seconds.
 - Setup: spaces around the email are removed, and an address that is not an email is reported on its field instead of as a connection failure.

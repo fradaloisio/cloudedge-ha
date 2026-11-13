@@ -104,5 +104,5 @@ get_coordinator_info:
 
 clear_cache:
   name: Clear Cache
-  description: Clear the CloudEdge session cache file. This will force re-authentication on the next API call.
+  description: Delete the saved CloudEdge session file. The current session goes on; the next login (after a restart, a reload or a rejected session) starts a new one, which logs the account out of the phone app.
   fields: {}

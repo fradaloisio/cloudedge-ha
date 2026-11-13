@@ -91,7 +91,7 @@ To change the options later, open the CloudEdge integration there and select
 | `cloudedge.refresh_device` | Reads one device again from the cloud, or every device when none is given. |
 | `cloudedge.refresh_parameters` | Reads only a device's parameters again. |
 | `cloudedge.get_coordinator_info` | Logs each account's refresh interval, last update and active live streams at INFO level. |
-| `cloudedge.clear_cache` | Deletes the saved CloudEdge session: the next request logs in again, which logs the account out of the phone app. |
+| `cloudedge.clear_cache` | Deletes the saved CloudEdge session file. The current session goes on; the next login (after a restart, a reload or a rejected session) starts a new one, which logs the account out of the phone app. |
 
 Devices are chosen by `device_name` or `device_id`; Developer Tools →
 Actions lists the fields of each action.
@@ -157,9 +157,10 @@ stream open with nobody watching. Either can drain the battery in hours.
 To limit the damage:
 
 - A battery camera's live view stops after 10 minutes (the *maximum live view
-  time* option). The camera then rests for 1 minute. If the same viewer is
-  still connected and the limit is reached again, the rest doubles each time,
-  up to 1 hour. While the camera rests, `stream_state` reads `live_limit` and
+  time* option). The camera then rests for 1 minute. If the limit is reached
+  again in a view that started less than 10 minutes after the rest ended (a
+  viewer that stayed connected reconnects at once), the rest doubles each
+  time, up to 1 hour. While the camera rests, `stream_state` reads `live_limit` and
   `stream_live_limit_rest` shows the seconds left; Home Assistant's stream
   errors in the log during a rest are expected.
 - A view that ends because the viewers left, or a change of the Stream
