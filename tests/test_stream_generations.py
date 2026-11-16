@@ -178,3 +178,78 @@ def test_callback_paused_during_mux_start_cannot_publish_into_next_session(
     assert bridge._video_codec is None
     assert bridge._video_queue.empty()
     assert stop_returned == [True], "stop() returned while a media callback ran"
+
+
+def test_retired_session_that_keeps_streaming_is_asked_to_stop_again(sessions):
+    # pycloudedge <= 0.1.12 drops a stop requested before run_session()
+    # starts: the retired session would keep the camera streaming, every
+    # frame discarded (C06). Its next callback repeats the request.
+    bridge = sessions.bridge
+    stopped = threading.Event()
+    delivered = threading.Event()
+
+    def retired_but_streaming(on_video):
+        assert stopped.wait(5)
+        on_video(H264_KEYFRAME)
+        delivered.set()
+        assert sessions.release[0].wait(5)
+
+    sessions.first_session = retired_but_streaming
+    sessions.start()
+    assert sessions.entered[0].wait(5)
+    streamer = sessions.created[0]
+    bridge.stop("worker_exit")
+    assert streamer.request_stop.call_count == 1
+    stopped.set()
+    assert delivered.wait(5)
+
+    assert streamer.request_stop.call_count == 2
+    assert not bridge._got_keyframe, "the frame itself is discarded"
+
+
+def test_live_session_gets_a_copy_of_the_coordinator_device(sessions, monkeypatch):
+    # The library refreshes streaming metadata into the device dict it is
+    # given, from the stream worker: the coordinator's own dict must not
+    # change outside the event loop (C22).
+    bridge = sessions.bridge
+    device = {"serial_number": "sn", "device_id": "id", "type_id": 1}
+    monkeypatch.setattr(bridge._coordinator, "get_device_for_stream", lambda _: device)
+    create = bridge._coordinator.client.create_streamer
+    received = []
+
+    def create_and_refresh(device, **kwargs):
+        received.append(device)
+        device["host_key"] = "refreshed"
+        return create(device=device, **kwargs)
+
+    monkeypatch.setattr(bridge._coordinator.client, "create_streamer", create_and_refresh)
+    sessions.start()
+    assert sessions.entered[0].wait(5)
+
+    assert received[0]["serial_number"] == "sn"
+    assert device == {"serial_number": "sn", "device_id": "id", "type_id": 1}
+
+
+def test_late_callback_of_a_retired_attempt_leaves_the_next_one_alone(monkeypatch):
+    # A library that calls back from its own threads could deliver a retired
+    # attempt's frame after the next attempt started: the repeated stop must
+    # reach the retired session only (review).
+    from test_stream_options import WatchedCamera, wait_until
+    from custom_components.cloudedge.stream_bridge import StreamOptions
+
+    camera = WatchedCamera(monkeypatch, StreamOptions())
+    try:
+        assert camera.view()
+        late_audio = camera.sessions[0]["on_audio"]
+        camera.bridge.set_stream_profile("SD")  # retires the first attempt
+        wait_until(
+            lambda: len(camera.streamers) == 2 and camera.streamers[1].streaming,
+            "the next attempt never started",
+        )
+
+        late_audio(b"\xff" * 160)
+
+        assert camera.streamers[0].request_stop.call_count == 2
+        assert not camera.streamers[1].request_stop.called
+    finally:
+        camera.close()

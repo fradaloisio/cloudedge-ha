@@ -9,19 +9,25 @@ from functools import lru_cache
 from typing import Any
 
 from homeassistant.components.camera import Camera, CameraEntityFeature
+from homeassistant.components.camera.const import DATA_CAMERA_PREFS
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from . import CloudEdgeCoordinator
 from .const import DOMAIN
-from .entity import CloudEdgeEntityMixin, is_camera_device
+from .entity import CloudEdgeEntityMixin, is_battery_device, is_camera_device
 
 _LOGGER = logging.getLogger(__name__)
 
 ALARM_IMAGE_MAX_AGE = 3600  # show alarm snapshot for up to 1 hour
+# Repair issue: Home Assistant's "Preload camera stream" keeps a stream open
+# with no viewer, which keeps waking a battery camera.
+PRELOAD_ISSUE = "preload_battery_camera"
 _CONNECTING_STREAM_STATES = {"starting", "waking", "connecting", "reconnecting"}
 
 
@@ -137,6 +143,8 @@ class CloudEdgeCamera(
         self._attr_unique_id = f"{DOMAIN}_{serial_number}_camera"
         self._attr_name = device_info.get("name", f"Camera {serial_number}")
         self._last_image: bytes | None = None
+        self._stream_settings = None
+        self._preload_flagged: bool | None = None
 
     async def async_added_to_hass(self) -> None:
         """Reopen the decoder before the bridge closes an obsolete format."""
@@ -146,9 +154,68 @@ class CloudEdgeCamera(
                 self._serial_number, self._async_stream_source_changed
             )
         )
+        # Home Assistant changes this object in place when the user switches
+        # "Preload camera stream", and announces nothing.
+        if (preferences := self.hass.data.get(DATA_CAMERA_PREFS)) is not None:
+            self._stream_settings = await preferences.get_dynamic_stream_settings(
+                self.entity_id
+            )
+        self._async_check_preload()
+
+    @callback
+    def _async_check_preload(self) -> None:
+        """Keep a repair issue while a battery camera's stream is preloaded."""
+        device_data = (self.coordinator.data or {}).get(self._serial_number)
+        flagged = bool(
+            self._stream_settings is not None
+            and self._stream_settings.preload_stream
+            and is_battery_device(device_data)
+        )
+        if flagged == self._preload_flagged:
+            return
+        self._preload_flagged = flagged
+        issue_id = f"{PRELOAD_ISSUE}_{self._serial_number}"
+        if not flagged:
+            ir.async_delete_issue(self.hass, DOMAIN, issue_id)
+            return
+        name = device_data.get("name") or self._serial_number
+        ir.async_create_issue(
+            self.hass,
+            DOMAIN,
+            issue_id,
+            is_fixable=True,
+            severity=ir.IssueSeverity.WARNING,
+            translation_key=PRELOAD_ISSUE,
+            translation_placeholders={"camera": name},
+            data={
+                "entity_id": self.entity_id,
+                "camera": name,
+                "entry_id": self.coordinator.config_entry.entry_id,
+            },
+        )
+
+    @callback
+    def _async_back_after_removal(self) -> bool:
+        """Return True when the entity is only unloaded, as by an entry reload.
+
+        Its repair issue must then stay: created again, it would forget that
+        the user chose to ignore it. A removed config entry deletes its
+        issues in async_remove_entry.
+        """
+        registry_entry = er.async_get(self.hass).async_get(self.entity_id)
+        return (
+            registry_entry is not None
+            and registry_entry.disabled_by is None
+            and self.coordinator.config_entry.disabled_by is None
+        )
 
     async def async_will_remove_from_hass(self) -> None:
         """Stop this entity's HA Stream: HA core does not do it on removal."""
+        if self._preload_flagged and not self._async_back_after_removal():
+            ir.async_delete_issue(
+                self.hass, DOMAIN, f"{PRELOAD_ISSUE}_{self._serial_number}"
+            )
+        self._preload_flagged = None
         stream, self.stream = self.stream, None
         if stream is not None:
             # Stream.stop() keeps a preloaded worker running, so clear the
@@ -276,6 +343,7 @@ class CloudEdgeCamera(
     def _handle_coordinator_update(self) -> None:
         """Cache alarm image locally when coordinator pushes new data."""
         super()._handle_coordinator_update()
+        self._async_check_preload()
         device_data = (
             self.coordinator.data.get(self._serial_number)
             if self.coordinator.data

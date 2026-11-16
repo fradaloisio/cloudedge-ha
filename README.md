@@ -67,10 +67,54 @@ a warning when it detects this setup.
    ```
 3. Restart Home Assistant
 
+## Configuration
+
+After the restart, go to **Settings → Devices & services → Add integration**,
+search for **CloudEdge** and enter the account's email, password and country.
+
+To change the options later, open the CloudEdge integration there and select
+**Configure**. Saving a change reloads the integration.
+
+| Option | Default | Effect |
+| --- | --- | --- |
+| Refresh interval | 5 minutes | How often device status and settings are read from the cloud. |
+| Battery cameras: maximum live view time | 10 minutes | A battery camera's live view stops after this time and the camera rests (see [Battery cameras](#battery-cameras)). `0` removes the limit. |
+| Battery cameras: keep streaming while someone is watching | On | Off lets the camera end each live window on its own after about 2 minutes; the picture then freezes for up to a minute while the next window opens. |
+| Camera audio in live streams | On | Off gives a video-only stream, for example if playback stalls. |
+
+## Actions and events
+
+| Action | What it does |
+| --- | --- |
+| `cloudedge.set_parameter` | Sets an IoT parameter of a device, named like `MOTION_DET_ENABLE`. |
+| `cloudedge.get_device_info` | Fires a `cloudedge_device_info` event with the device's details, secrets redacted; `include_config` adds its parameters. |
+| `cloudedge.refresh_device` | Reads one device again from the cloud, or every device when none is given. |
+| `cloudedge.refresh_parameters` | Reads only a device's parameters again. |
+| `cloudedge.get_coordinator_info` | Logs each account's refresh interval, last update and active live streams at INFO level. |
+| `cloudedge.clear_cache` | Deletes the saved CloudEdge session file. The current session goes on; the next login (after a restart, a reload or a rejected session) starts a new one, which logs the account out of the phone app. |
+
+Devices are chosen by `device_name` or `device_id`; Developer Tools →
+Actions lists the fields of each action.
+
+Every push event from a camera (motion, person, visitor, package and the other
+alarm types) also fires a `cloudedge_event` event with `device_id`, `serial_number`,
+`device_name`, `event_type`, `event_code`, `is_motion` and
+`alarm_image_url`. For example, to trigger an automation on any motion event:
+
+```yaml
+triggers:
+  - trigger: event
+    event_type: cloudedge_event
+    event_data:
+      is_motion: true
+```
 
 ## Enable Debug Logging
 
-Add this to your `configuration.yaml` to enable detailed logging:
+Open the CloudEdge integration in **Settings → Devices & services** and select
+**Enable debug logging**; disabling it downloads the log. This covers the
+integration and the `pycloudedge` library. To keep debug logging across
+restarts, add this to `configuration.yaml` instead:
 
 ```yaml
 logger:
@@ -78,19 +122,55 @@ logger:
   logs:
     custom_components.cloudedge: debug
     cloudedge: debug
+    pycloudedge: debug
 ```
 
-Then restart Home Assistant and check the logs for detailed information.
+## Troubleshooting
+
+- **The phone app logs out, or the integration asks to sign in again**: the
+  account has only one active session, see
+  [Important note about CloudEdge sessions](#important-note-about-cloudedge-sessions).
+- **A battery camera's live view stops and does not restart for a while**:
+  the maximum live view time was reached and the camera rests, see
+  [Battery cameras](#battery-cameras).
+- **The HLS live view or still images fail while WebRTC works**: check the
+  `no_proxy` note under [Installation](#installation).
+- **A repair says "Preload camera stream" keeps a camera awake**: open it and
+  submit to turn the preload off for that camera.
 
 ## Live Streaming
 
 Supported cameras expose a Home Assistant `camera.*` entity with experimental
-live streaming. Battery-powered CloudEdge cameras wake only for finite live-view
-windows, so the stream may reconnect when the camera goes back to sleep. While
-Home Assistant waits, the camera snapshot shows a language-neutral animated
-loading indicator.
+live streaming. A battery-powered camera is woken for the live view, which
+takes a few seconds. While Home Assistant waits, the camera snapshot shows a
+language-neutral animated loading indicator.
 Incoming G.711 camera audio is included in the live stream as browser-compatible
-AAC mono audio.
+AAC mono audio, unless it is turned off in the options.
+
+### Battery cameras
+
+A battery camera stays awake, and streams, for as long as a viewer is
+connected. A dashboard card left open on a tablet counts as a viewer, and so
+does Home Assistant's **Preload camera stream** setting, which keeps the
+stream open with nobody watching. Either can drain the battery in hours.
+
+To limit the damage:
+
+- A battery camera's live view stops after 10 minutes (the *maximum live view
+  time* option). The camera then rests for 1 minute. If the limit is reached
+  again in a view that started less than 10 minutes after the rest ended (a
+  viewer that stayed connected reconnects at once), the rest doubles each
+  time, up to 1 hour. While the camera rests, `stream_state` reads `live_limit` and
+  `stream_live_limit_rest` shows the seconds left; Home Assistant's stream
+  errors in the log during a rest are expected.
+- A view that ends because the viewers left, or a change of the Stream
+  profile, starts again from the 1 minute rest. Changing the Stream profile
+  also ends a rest in progress.
+- Do not turn on **Preload camera stream** for a battery camera. If it is on,
+  the integration raises a repair issue in **Settings → Repairs** that can
+  turn it off for you.
+
+A camera counts as battery-powered when it reports a battery level.
 
 Each camera also exposes a **Stream profile** select entity:
 
@@ -192,8 +272,13 @@ Raise both together.
 
 When testing changes in both repositories, install the corresponding local
 `pycloudedge` checkout in this development environment, or place it on
-`PYTHONPATH`. Release the library before updating the pinned version in both
-`manifest.json` and `requirements-dev.txt`.
+`PYTHONPATH`. During release preparation, install the local library wheel before
+`requirements-dev.txt` when its pinned version is not yet on PyPI. Publish the
+library before publishing the integration that requires it. Both `manifest.json`
+and `requirements-dev.txt` must pin the same library version.
+
+See [Release preparation](RELEASE.md) for the coordinated 1.5.0 / 0.1.13 release,
+local artifact validation and publication order.
 
 ### Test with Docker
 
@@ -242,7 +327,7 @@ triggers:
 
 variables:
   camera_map:
-    binary_sensor.citofono_motion: camera.balcony_balcony
+    binary_sensor.balcony_motion: camera.balcony_balcony
     binary_sensor.garage_motion: camera.garage_garage
   camera_entity: "{{ camera_map[trigger.entity_id] }}"
   name: "{{ trigger.to_state.name | default(trigger.entity_id) }}"

@@ -342,6 +342,7 @@ def test_setup_auth_failure_stops_transports(tmp_path):
             "country_code": "IT",
             "phone_code": "+39",
         }
+        entry.options = {}
         stop_mqtt = Mock()
         stop_streams = Mock()
         with patch("homeassistant.helpers.frame.report_usage"), \
@@ -384,6 +385,7 @@ def test_home_assistant_stop_stops_live_streams_off_the_event_loop(tmp_path):
             "country_code": "IT",
             "phone_code": "+39",
         }
+        entry.options = {}
         on_unload = []
         entry.async_on_unload = on_unload.append
         stopped_on = []
@@ -719,6 +721,7 @@ def _make_setup_entry():
         "country_code": "IT",
         "phone_code": "+39",
     }
+    entry.options = {}
     return entry
 
 

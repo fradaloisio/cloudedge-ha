@@ -10,7 +10,7 @@ from typing import Any
 import voluptuous as vol
 
 from homeassistant import config_entries
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.data_entry_flow import FlowResult
 from homeassistant.exceptions import HomeAssistantError
 
@@ -21,11 +21,16 @@ from .const import (
     CONF_COUNTRY_CODE,
     CONF_PHONE_CODE,
     CONF_REFRESH_INTERVAL,
+    CONF_BATTERY_KEEPALIVE,
+    CONF_BATTERY_MAX_LIVE_MINUTES,
+    CONF_STREAM_AUDIO,
     DEFAULT_REFRESH_INTERVAL,
     DEFAULT_COUNTRY_CODE,
     DEFAULT_PHONE_CODE,
     COUNTRY_CODES,
+    MAX_BATTERY_MAX_LIVE_MINUTES,
 )
+from .options import entry_options
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -45,6 +50,19 @@ STEP_USER_DATA_SCHEMA = vol.Schema(
     }
 )
 
+OPTIONS_SCHEMA = vol.Schema(
+    {
+        vol.Required(CONF_REFRESH_INTERVAL): vol.All(
+            vol.Coerce(int), vol.Range(min=1, max=60)
+        ),
+        vol.Required(CONF_BATTERY_MAX_LIVE_MINUTES): vol.All(
+            vol.Coerce(int), vol.Range(min=0, max=MAX_BATTERY_MAX_LIVE_MINUTES)
+        ),
+        vol.Required(CONF_BATTERY_KEEPALIVE): bool,
+        vol.Required(CONF_STREAM_AUDIO): bool,
+    }
+)
+
 
 async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> dict[str, Any]:
     """Validate the user input allows us to connect.
@@ -53,9 +71,9 @@ async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> dict[str,
     """
     # Import here to avoid issues during startup
     from cloudedge import CloudEdgeClient
-    from cloudedge.exceptions import AuthenticationError, CloudEdgeError
+    from cloudedge.exceptions import AuthenticationError, CloudEdgeError, ValidationError
 
-    username = data[CONF_USERNAME]
+    username = data[CONF_USERNAME].strip()
     password = data[CONF_PASSWORD]
     country_code = data[CONF_COUNTRY_CODE]
     phone_code = data[CONF_PHONE_CODE]
@@ -109,6 +127,9 @@ async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> dict[str,
 
     except InvalidAuth:
         raise
+    except ValidationError as e:
+        # The library checks the email format before any request.
+        raise InvalidEmail("Invalid email address") from e
     except AuthenticationError as e:
         _LOGGER.error("Authentication failed: %s", e)
         raise InvalidAuth("Authentication failed") from e
@@ -126,6 +147,14 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     VERSION = 1
     _reauth_entry: config_entries.ConfigEntry | None = None
 
+    @staticmethod
+    @callback
+    def async_get_options_flow(
+        config_entry: config_entries.ConfigEntry,
+    ) -> OptionsFlowHandler:
+        """Return the options flow."""
+        return OptionsFlowHandler()
+
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
@@ -133,10 +162,13 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         errors: dict[str, str] = {}
         
         if user_input is not None:
+            user_input = {
+                **user_input, CONF_USERNAME: user_input[CONF_USERNAME].strip()
+            }
             # Duplicate check BEFORE logging in: a validation login kills
             # the active CloudEdge session (one session per account), so
             # don't pay that price for an account that is already set up.
-            await self.async_set_unique_id(user_input[CONF_USERNAME].strip().lower())
+            await self.async_set_unique_id(user_input[CONF_USERNAME].lower())
             self._abort_if_unique_id_configured()
 
             try:
@@ -145,6 +177,8 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 return self.async_create_entry(title=info["title"], data=user_input)
             except CannotConnect:
                 errors["base"] = "cannot_connect"
+            except InvalidEmail:
+                errors[CONF_USERNAME] = "invalid_email"
             except InvalidAuth:
                 errors["base"] = "invalid_auth"
             except Exception:  # pylint: disable=broad-except
@@ -205,9 +239,34 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         )
 
 
+class OptionsFlowHandler(config_entries.OptionsFlowWithReload):
+    """Polling and live-stream options. Saving a change reloads the entry."""
+
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Show the options with their current values, then store them."""
+        if user_input is not None:
+            if user_input == entry_options(self.config_entry):
+                # Nothing changed: storing the defaults an entry made before
+                # the options holds would still reload it, ending live views.
+                return self.async_create_entry(data=dict(self.config_entry.options))
+            return self.async_create_entry(data=user_input)
+        return self.async_show_form(
+            step_id="init",
+            data_schema=self.add_suggested_values_to_schema(
+                OPTIONS_SCHEMA, entry_options(self.config_entry)
+            ),
+        )
+
+
 class CannotConnect(HomeAssistantError):
     """Error to indicate we cannot connect."""
 
 
 class InvalidAuth(HomeAssistantError):
     """Error to indicate there is invalid auth."""
+
+
+class InvalidEmail(InvalidAuth):
+    """Error to indicate the username is not an email address."""

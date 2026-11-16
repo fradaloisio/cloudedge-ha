@@ -278,14 +278,6 @@ async def async_setup_services(hass: HomeAssistant) -> None:
                 info = _read_device_info_by_identity(
                     coordinator.client, device, include_config
                 )
-            elif include_config and not info.get("configuration"):
-                # pycloudedge <= 0.1.11 only parses result.iot; the live
-                # /openapi/device/config reply carries a top-level iot.
-                serial = device.get("serial_number") or info.get("serial_number")
-                if serial:
-                    info["configuration"] = _read_configuration(
-                        coordinator.client, serial
-                    )
             return info
 
         device_info = await hass.async_add_executor_job(_read)

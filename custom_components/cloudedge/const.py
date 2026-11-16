@@ -8,9 +8,19 @@ CONF_PASSWORD = "password"
 CONF_COUNTRY_CODE = "country_code"
 CONF_PHONE_CODE = "phone_code"
 CONF_REFRESH_INTERVAL = "refresh_interval"
+# Options
+CONF_BATTERY_MAX_LIVE_MINUTES = "battery_max_live_minutes"
+CONF_BATTERY_KEEPALIVE = "battery_keepalive"
+CONF_STREAM_AUDIO = "stream_audio"
 
 # Default values
 DEFAULT_REFRESH_INTERVAL = 5  # minutes
+# A live view keeps a battery camera awake for as long as a viewer stays
+# connected (a dashboard left open, a preloaded stream), so it is limited.
+DEFAULT_BATTERY_MAX_LIVE_MINUTES = 10  # 0 = no limit
+MAX_BATTERY_MAX_LIVE_MINUTES = 120
+DEFAULT_BATTERY_KEEPALIVE = True
+DEFAULT_STREAM_AUDIO = True
 DEFAULT_COUNTRY_CODE = "US"
 DEFAULT_PHONE_CODE = "+1"
 
@@ -237,6 +247,9 @@ SENSOR_PARAMETERS = {
 ENABLED_BY_DEFAULT_SENSOR_PARAMS = [
     "154",   # BATTERY_PERCENT - Battery percentage (diagnostic)
 ]
+
+# BATTERY_PERCENT: only battery-powered devices report it.
+BATTERY_PARAMETER_CODE = "154"
 
 # Parameter codes holding device secrets. They never become entities (states
 # are readable by every HA user and kept by the recorder) and are redacted

@@ -112,11 +112,22 @@ async def async_setup_entry(
         return sensors
 
     added: set[str] = set()
+    built_for: list[frozenset | None] = [None]
 
     @callback
     def _async_add_missing() -> None:
         # A sleeping camera may expose its parameters only on a later refresh.
         # Keep existing entity IDs and add each newly discovered sensor once.
+        # Most updates, stream state changes included, bring no new device or
+        # parameter: building every candidate sensor again (and looking each
+        # known parameter up in the registry) is then skipped.
+        layout = frozenset(
+            (serial_number, frozenset(device_info.get("configuration") or ()))
+            for serial_number, device_info in (coordinator.data or {}).items()
+        )
+        if layout == built_for[0]:
+            return
+        built_for[0] = layout
         sensors = [entity for entity in _build_sensors() if entity.unique_id not in added]
         if sensors:
             added.update(entity.unique_id for entity in sensors)
@@ -197,7 +208,9 @@ class CloudEdgeConfigSensor(CloudEdgeBaseSensor):
         elif param_name in ["motion_sensitivity", "speaker_volume", "microphone_volume"]:
             self._attr_native_unit_of_measurement = PERCENTAGE
             self._attr_state_class = SensorStateClass.MEASUREMENT
-            self._attr_entity_category = EntityCategory.CONFIG
+            # Read-only settings: Home Assistant refuses a sensor in the
+            # config category as soon as it is enabled.
+            self._attr_entity_category = EntityCategory.DIAGNOSTIC
         else:
             self._attr_entity_category = EntityCategory.DIAGNOSTIC
 
