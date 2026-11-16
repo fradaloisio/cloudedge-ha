@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 1.5.0
+
+Adds configurable battery-camera live view limits, a repair for stream preloading and integration options, using pycloudedge 0.1.13.
 
 Changes:
 - Add options (Configure): refresh interval, a maximum live view time for battery cameras, session keepalives for battery cameras, and camera audio. Saving a change reloads the integration; saving without changes does not.
@@ -13,6 +15,9 @@ Changes:
 - A live session that ignored its stop request (possible with pycloudedge 0.1.12 when the stop came before the session started) is asked again as soon as it delivers anything, instead of keeping the camera streaming unwatched.
 - The live stream no longer changes the coordinator's device data from its worker thread, and sensors are no longer rebuilt on every update that brings no new parameter.
 - README: actions, the `cloudedge_event` event, debug logging from the UI and troubleshooting.
+- Update pycloudedge to 0.1.13 for fragmented-video recovery, MQTT callback handling and authentication recovery after temporary credential-renewal failures.
+
+Requirements: Home Assistant 2026.9.4 or newer. Restart Home Assistant after updating. Existing battery cameras use the new 10-minute live view limit by default; set it to `0` in Configure to remove the limit.
 
 ## 1.4.4
 

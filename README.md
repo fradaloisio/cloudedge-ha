@@ -272,8 +272,13 @@ Raise both together.
 
 When testing changes in both repositories, install the corresponding local
 `pycloudedge` checkout in this development environment, or place it on
-`PYTHONPATH`. Release the library before updating the pinned version in both
-`manifest.json` and `requirements-dev.txt`.
+`PYTHONPATH`. During release preparation, install the local library wheel before
+`requirements-dev.txt` when its pinned version is not yet on PyPI. Publish the
+library before publishing the integration that requires it. Both `manifest.json`
+and `requirements-dev.txt` must pin the same library version.
+
+See [Release preparation](RELEASE.md) for the coordinated 1.5.0 / 0.1.13 release,
+local artifact validation and publication order.
 
 ### Test with Docker
 
