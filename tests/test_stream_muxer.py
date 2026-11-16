@@ -380,39 +380,58 @@ def test_video_gap_longer_than_ha_source_timeout_keeps_ha_stream_running(
     """A battery camera's reconnect leaves the source about 70 s without
     video. Without data HA's stream worker fails after SOURCE_TIMEOUT (30 s),
     then its reconnect fails on a jump above MAX_TIMESTAMP_GAP (30 s): an
-    error, a backoff and a hole in HLS at every live window. Both HA limits are
-    scaled to 3 s; the bridge re-feeds its held IDR after 0.5 s, every 0.5 s.
+    error, a backoff and a hole in HLS at every live window. The read timeout
+    and timestamp gap are scaled to 3 s. The silent window begins after HA
+    consumes video and the bridge re-feeds its held IDR every 0.5 s.
     Real FFmpeg, bridge TCP source and P2P worker, and HA stream worker."""
     codec, units = video_units
-    monkeypatch.setattr(ha_stream_worker, "SOURCE_TIMEOUT", 3)
+    # PyAV accepts separate open and read timeouts. Preserve HA's startup
+    # budget for codec probing and scale the gap's read deadline.
+    open_timeout = ha_stream_worker.SOURCE_TIMEOUT
+    monkeypatch.setattr(
+        ha_stream_worker, "SOURCE_TIMEOUT", (open_timeout, 3)
+    )
     monkeypatch.setattr(ha_stream_worker, "MAX_TIMESTAMP_GAP", 3)
     monkeypatch.setattr("homeassistant.components.stream.STREAM_RESTART_INCREMENT", 1)
     monkeypatch.setattr(bridge_module, "_KEEPALIVE_GAP", 0.5, raising=False)
     monkeypatch.setattr(bridge_module, "_KEEPALIVE_INTERVAL", 0.5, raising=False)
     video_packets: list[tuple[float, float]] = []  # (arrival, dts seconds)
+    stream_ready = threading.Event()
     mux_packet = ha_stream_worker.StreamMuxer.mux_packet
 
     def record_packet(muxer, packet):
+        mux_packet(muxer, packet)
         if packet.stream.type == "video":
             video_packets.append(
                 (time.monotonic(), float(packet.dts * packet.time_base))
             )
-        mux_packet(muxer, packet)
+            stream_ready.set()
 
     monkeypatch.setattr(ha_stream_worker.StreamMuxer, "mux_packet", record_packet)
     moments: dict[str, float] = {}
 
     def camera_feed(on_video):
-        # 15 fps like the cameras: HA's open analyses 20 video frames, which
-        # must fit in its scaled 3 s budget. GOPs of 10, repeated in order.
+        # Feed 15 fps until HA consumes video, then finish the GOP so the
+        # missing five frames include the next IDR. Codec probing can take
+        # different amounts of time across FFmpeg builds and platforms.
         next_at = time.monotonic()
-        for index in [*range(40), *range(45, 90)]:
-            if index == 45:
-                # Silent for over twice HA's source timeout, then back in the
-                # middle of a GOP: 45-49 refer to frames that never came.
-                time.sleep(7.0)
-                next_at = time.monotonic()
-            if index == 50:  # the camera's next IDR
+        startup_deadline = next_at + open_timeout
+        index = 0
+        while not stream_ready.is_set() or index % 10 != 0:
+            assert time.monotonic() < startup_deadline, (
+                "HA never consumed the initial video"
+            )
+            on_video(units[index % len(units)])
+            index += 1
+            next_at += 1 / 15
+            time.sleep(max(0.0, next_at - time.monotonic()))
+
+        # Pause for over twice HA's read timeout and return mid-GOP.
+        first_after_gap = index + 5
+        time.sleep(7.0)
+        next_at = time.monotonic()
+        for index in range(first_after_gap, first_after_gap + 45):
+            if index == first_after_gap + 5:
                 moments["idr"] = time.monotonic()
             on_video(units[index % len(units)])
             next_at += 1 / 15
